@@ -7,7 +7,7 @@ load("//:defs.bzl",
 )
 
 # ---------------------------------------------------------------------------
-# Echo controller
+# Echo controller (no manifests — used by controller_test)
 # ---------------------------------------------------------------------------
 
 kubernetes_controller(
@@ -17,7 +17,19 @@ kubernetes_controller(
 )
 
 # ---------------------------------------------------------------------------
-# Manifest set for manifest_test
+# Echo controller with attached manifests — used by controller_manifest_test
+# ---------------------------------------------------------------------------
+
+kubernetes_controller(
+    name              = "echo_controller_with_manifest",
+    controller_binary = "//tests/controllers/echo_controller:echo_controller_bin",
+    manifests         = ":test_manifests",
+    ready_probe       = "env_file",
+)
+
+# ---------------------------------------------------------------------------
+# Manifest set shared by manifest_test, controller_manifest_test,
+# and server_manifest_test
 # ---------------------------------------------------------------------------
 
 kubernetes_manifest(
@@ -52,6 +64,14 @@ kubernetes_test(
     size       = "medium",
 )
 
+# Controller + manifest composition: manifest flows through kubernetes_controller.
+kubernetes_test(
+    name       = "controller_manifest_test",
+    srcs       = ["controller_manifest_test.sh"],
+    controller = ":echo_controller_with_manifest",
+    size       = "medium",
+)
+
 # ---------------------------------------------------------------------------
 # kubernetes_server lifecycle test
 # ---------------------------------------------------------------------------
@@ -63,6 +83,20 @@ kubernetes_server(
 kubernetes_health_check(
     name   = "k8s_server_test_health",
     server = ":k8s_server_test_svc",
+)
+
+# ---------------------------------------------------------------------------
+# kubernetes_server + kubernetes_manifest composition test
+# ---------------------------------------------------------------------------
+
+kubernetes_server(
+    name      = "k8s_server_manifest_svc",
+    manifests = ":test_manifests",
+)
+
+kubernetes_health_check(
+    name   = "k8s_server_manifest_health",
+    server = ":k8s_server_manifest_svc",
 )
 
 sh_test(
@@ -79,4 +113,12 @@ sh_test(
     args = ["$(rootpath :k8s_server_test_health)"],
     data = [":k8s_server_test_health"],
     size = "small",
+)
+
+sh_test(
+    name = "server_manifest_test",
+    srcs = ["server_manifest_test.sh"],
+    args = ["$(rootpath :k8s_server_manifest_svc)"],
+    data = [":k8s_server_manifest_svc"],
+    size = "medium",
 )

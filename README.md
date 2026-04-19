@@ -119,6 +119,235 @@ echo "PASS"
 
 ---
 
+## Examples
+
+### API-server-only test (no controller)
+
+Tests for client libraries, admission webhooks, or any code that only needs
+the API server — no controller binary required.
+
+```python
+# BUILD.bazel
+kubernetes_test(
+    name = "client_test",
+    srcs = ["client_test.sh"],
+    size = "medium",
+)
+```
+
+```bash
+# client_test.sh
+set -euo pipefail
+require_env() { [[ -n "${!1:-}" ]] || { echo "ERROR: \$$1 not set" >&2; exit 1; }; }
+require_env KUBECONFIG
+require_env KUBE_NAMESPACE
+require_env KUBECTL
+
+# Create a resource and verify it round-trips.
+"$KUBECTL" create configmap test-cm \
+    --namespace "$KUBE_NAMESPACE" \
+    --kubeconfig "$KUBECONFIG" \
+    --from-literal=key=hello
+
+VAL=$("$KUBECTL" get configmap test-cm \
+    --namespace "$KUBE_NAMESPACE" \
+    --kubeconfig "$KUBECONFIG" \
+    -o jsonpath='{.data.key}')
+[[ "$VAL" == "hello" ]] || { echo "FAIL: got $VAL" >&2; exit 1; }
+echo "PASS"
+```
+
+---
+
+### CRD + RBAC + controller (leader-election)
+
+A typical controller-runtime operator that uses leader election.
+
+```python
+# BUILD.bazel
+load("@rules_kubernetes//:defs.bzl", "kubernetes_manifest", "kubernetes_controller", "kubernetes_test")
+
+kubernetes_manifest(
+    name = "crds_and_rbac",
+    srcs = glob(["config/crd/*.yaml"]) + glob(["config/rbac/*.yaml"]),
+    # Applied in listed order — CRDs first, then RBAC.
+)
+
+kubernetes_controller(
+    name              = "operator",
+    controller_binary = "//cmd/operator",
+    manifests         = ":crds_and_rbac",
+    ready_probe       = "lease",   # controller-runtime leader election
+)
+
+kubernetes_test(
+    name       = "operator_test",
+    srcs       = ["operator_test.sh"],
+    controller = ":operator",
+    size       = "medium",
+)
+```
+
+```bash
+# operator_test.sh — the operator is fully ready before this runs.
+set -euo pipefail
+require_env() { [[ -n "${!1:-}" ]] || { echo "ERROR: \$$1 not set" >&2; exit 1; }; }
+require_env KUBECONFIG; require_env KUBE_NAMESPACE; require_env KUBECTL
+
+# Apply a custom resource and wait for the operator to reconcile it.
+"$KUBECTL" apply -f - --kubeconfig "$KUBECONFIG" <<EOF
+apiVersion: mygroup.example.com/v1
+kind: MyResource
+metadata:
+  name: test-resource
+  namespace: $KUBE_NAMESPACE
+spec:
+  replicas: 1
+EOF
+
+# Wait for the operator to set status.ready=true.
+for i in $(seq 1 30); do
+    ready=$("$KUBECTL" get myresource test-resource \
+        --namespace "$KUBE_NAMESPACE" \
+        --kubeconfig "$KUBECONFIG" \
+        -o jsonpath='{.status.ready}' 2>/dev/null || echo "false")
+    [[ "$ready" == "true" ]] && break
+    sleep 1
+done
+
+[[ "$ready" == "true" ]] || { echo "FAIL: resource never became ready" >&2; exit 1; }
+echo "PASS"
+```
+
+---
+
+### Go test with `go_test`
+
+```python
+# BUILD.bazel
+load("@io_bazel_rules_go//go:def.bzl", "go_test")
+load("@rules_kubernetes//:defs.bzl", "kubernetes_manifest", "kubernetes_controller", "kubernetes_test")
+
+kubernetes_manifest(
+    name = "crds",
+    srcs = glob(["testdata/crd/*.yaml"]),
+)
+
+kubernetes_controller(
+    name              = "controller",
+    controller_binary = "//cmd/controller",
+    manifests         = ":crds",
+    ready_probe       = "env_file",
+)
+
+kubernetes_test(
+    name       = "reconciler_go_test",
+    srcs       = ["reconciler_test.go"],
+    deps       = [
+        "//internal/controller",
+        "@io_k8s_client_go//kubernetes:go_default_library",
+    ],
+    controller = ":controller",
+    test_rule  = go_test,
+    size       = "medium",
+)
+```
+
+```go
+// reconciler_test.go
+package controller_test
+
+import (
+    "os"
+    "testing"
+
+    "k8s.io/client-go/kubernetes"
+    "k8s.io/client-go/tools/clientcmd"
+)
+
+func TestReconciler(t *testing.T) {
+    kubeconfig := os.Getenv("KUBECONFIG")
+    namespace  := os.Getenv("KUBE_NAMESPACE")
+
+    cfg, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+    if err != nil {
+        t.Fatalf("build config: %v", err)
+    }
+    client, err := kubernetes.NewForConfig(cfg)
+    if err != nil {
+        t.Fatalf("new client: %v", err)
+    }
+
+    // Test runs against a real API server in namespace.
+    _ = client
+    _ = namespace
+}
+```
+
+---
+
+### Shared server for multi-service integration tests (`rules_itest`)
+
+```python
+# BUILD.bazel
+load("@rules_kubernetes//:defs.bzl", "kubernetes_manifest", "kubernetes_server", "kubernetes_health_check")
+load("@rules_itest//:defs.bzl", "itest_service", "service_test")
+
+kubernetes_manifest(
+    name = "crds",
+    srcs = glob(["config/crd/*.yaml"]),
+)
+
+kubernetes_server(
+    name      = "k8s",
+    manifests = ":crds",
+)
+
+kubernetes_health_check(
+    name   = "k8s_health",
+    server = ":k8s",
+)
+
+itest_service(
+    name         = "k8s_svc",
+    exe          = ":k8s",
+    health_check = ":k8s_health",
+)
+
+itest_service(
+    name = "api_svc",
+    exe  = "//cmd/api",
+    deps = [":k8s_svc"],
+    http_health_check_address = "http://127.0.0.1:${PORT}/healthz",
+    autoassign_port = True,
+)
+
+service_test(
+    name     = "api_integration_test",
+    test     = ":api_test_bin",
+    services = [":k8s_svc", ":api_svc"],
+)
+```
+
+```bash
+# api_test.sh — both services are running before this executes.
+set -euo pipefail
+
+# Source the kubernetes_server env file to get KUBECONFIG and KUBECTL.
+source "$TEST_TMPDIR/k8s.env"
+
+API_PORT=$(echo "$ASSIGNED_PORTS" | python3 -c "
+import json, sys
+print(json.load(sys.stdin)['//myapp:api_svc'])
+")
+
+# Verify the API can reach the database (which talks to the k8s cluster).
+curl -sf "http://127.0.0.1:${API_PORT}/healthz" | grep -q '"status":"ok"'
+echo "PASS"
+```
+
+---
+
 ## Public API
 
 ```python

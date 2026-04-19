@@ -419,9 +419,8 @@ complex readiness protocol. The base rules are useful without it.
 - **Target name collision.** Two `kubernetes_server` targets with the same local
   name in different packages write to the same `$TEST_TMPDIR/<name>.env`. Use
   unique target names within a test run.
-- **TLS cert generation.** The launcher requires either `cryptography` (Python
-  package) or `openssl` in `PATH`. `openssl` is present on all supported
-  platforms; `cryptography` is optional but faster.
+- **TLS cert generation.** The launcher requires `openssl` in `PATH`. It is
+  present on all supported Linux and macOS platforms.
 - **Windows not supported.** No pre-built binary source; PRs welcome.
 - **darwin tarball checksums are placeholders** until real SHA-256 values are
   pinned in `extensions.bzl`.

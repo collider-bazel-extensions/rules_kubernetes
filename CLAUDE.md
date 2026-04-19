@@ -278,15 +278,17 @@ All tests must pass before any commit with code changes.
 
 ### Test results (last full run: 2026-04-19)
 
-All 5 tests pass on Linux x86_64 with Kubernetes 1.29 (envtest binaries).
+All 7 tests pass on Linux x86_64 with Kubernetes 1.29 (envtest binaries).
 
-| Test target                       | What it verifies                                                              | Result |
-|-----------------------------------|-------------------------------------------------------------------------------|--------|
-| `//tests:apiserver_smoke_test`    | API server connectivity, namespace isolation, ConfigMap CRUD                  | PASSED |
-| `//tests:manifest_test`           | kubernetes_manifest applies YAML before the test binary runs                  | PASSED |
-| `//tests:controller_test`         | echo_controller mirrors ConfigMaps; env_file readiness probe                  | PASSED |
-| `//tests:kubernetes_server_test`  | kubernetes_server starts, writes env file, responds to SIGTERM                | PASSED |
-| `//tests:kubernetes_health_check_test` | kubernetes_health_check exits non-zero without env file, 0 when present  | PASSED |
+| Test target                            | What it verifies                                                              | Result |
+|----------------------------------------|-------------------------------------------------------------------------------|--------|
+| `//tests:apiserver_smoke_test`         | API server connectivity, namespace isolation, ConfigMap CRUD                  | PASSED |
+| `//tests:manifest_test`                | kubernetes_manifest applies YAML before the test binary runs                  | PASSED |
+| `//tests:controller_test`              | echo_controller mirrors ConfigMaps; env_file readiness probe                  | PASSED |
+| `//tests:controller_manifest_test`     | kubernetes_controller with attached manifest: manifest applied + controller running | PASSED |
+| `//tests:server_manifest_test`         | kubernetes_server with manifests: manifest applied before env file written    | PASSED |
+| `//tests:kubernetes_server_test`       | kubernetes_server starts, writes env file, responds to SIGTERM                | PASSED |
+| `//tests:kubernetes_health_check_test` | kubernetes_health_check exits non-zero without env file, 0 when present       | PASSED |
 
 ### Launcher script
 
