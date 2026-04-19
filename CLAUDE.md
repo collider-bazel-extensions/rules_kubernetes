@@ -114,14 +114,20 @@ modes:
 **Auto-detection** — when `bin_dir` is omitted, the repository rule resolves
 both binaries:
 
-1. `command -v kube-apiserver` / `command -v etcd` (PATH lookup)
-2. Common paths: `/usr/local/kubebuilder/bin`, `/usr/local/bin`, `/usr/bin`
+1. `command -v kube-apiserver` (PATH lookup)
+2. Common paths: `/usr/local/kubebuilder/bin`, `/usr/local/bin`, `/usr/bin`,
+   and `$HOME/.local/kubebuilder/bin`
 
 If either binary cannot be found, the build fails with a clear error pointing
 to the missing binary and a suggested install command.
 
-Download source: `https://storage.googleapis.com/kubebuilder-tools/` (same
-tarballs used by `setup-envtest` from `sigs.k8s.io/controller-runtime`).
+Download source: GitHub releases from `kubernetes-sigs/controller-tools`
+(the same tarballs used by `setup-envtest` from `sigs.k8s.io/controller-runtime`):
+
+```
+https://github.com/kubernetes-sigs/controller-tools/releases/download/
+    envtest-v<version>/envtest-v<version>-<os>-<arch>.tar.gz
+```
 
 Platforms supported: `linux_amd64`, `darwin_arm64`, `darwin_amd64`.
 
@@ -162,6 +168,7 @@ Failures surface as `bazel build` errors, not as flaky test failures.
 KUBECONFIG=/tmp/.../kubeconfig
 KUBE_NAMESPACE=k8s-test-abc123def456
 KUBE_API_SERVER=https://127.0.0.1:54321
+KUBECTL=/path/to/kubectl
 ```
 
 `kubernetes_health_check` exits 0 iff this file exists.
@@ -189,6 +196,9 @@ kubernetes_controller(
     name              = "my_controller",
     controller_binary = "//cmd/controller",   # required: a *_binary target
     manifests         = ":my_crds",           # optional
+    ready_probe       = "lease",              # "lease" (default) or "env_file"
+    # "lease": polls for a leader-election Lease object in the namespace
+    # "env_file": controller writes $RULES_K8S_READY_FILE when ready
 )
 
 # Run an isolated test against an ephemeral Kubernetes API server.
@@ -223,6 +233,7 @@ kubernetes_health_check(
 | `KUBECONFIG`      | `$TEST_TMPDIR/kubeconfig` | Path to per-test kubeconfig file   |
 | `KUBE_NAMESPACE`  | `k8s-test-abc123def456`   | Isolated per-test namespace        |
 | `KUBE_API_SERVER` | `https://127.0.0.1:54321` | API server address                 |
+| `KUBECTL`         | `/path/to/kubectl`        | Absolute path to the kubectl binary |
 
 ### MODULE.bazel (Bzlmod)
 
@@ -313,7 +324,9 @@ server mode writes the env file and blocks.
 All test shell scripts must:
 - Begin with `set -euo pipefail`.
 - Use a `require_env VAR` guard for `KUBECONFIG`, `KUBE_NAMESPACE`,
-  `KUBE_API_SERVER` before first use.
+  `KUBE_API_SERVER`, and `KUBECTL` before first use.
+- Use `"$KUBECTL"` (not bare `kubectl`) — `kubectl` is not on `$PATH` in the
+  sandbox; the launcher injects its absolute path via the `KUBECTL` env var.
 - Pass `--namespace "$KUBE_NAMESPACE"` on kubectl calls to stay scoped to the
   isolated test namespace.
 - Pass `--kubeconfig "$KUBECONFIG"` (or rely on the injected `KUBECONFIG` env
@@ -332,7 +345,7 @@ All test shell scripts must:
   `Running`. Use kwok (Phase 2) if simulated pod lifecycle is needed.
 - **Windows is not supported** (no pre-built binary source; PRs welcome).
 - **TLS cert generation** requires `openssl` in `PATH` (present on all
-  supported platforms) or the `cryptography` Python package.
+  supported Linux and macOS platforms).
 - **Controller readiness** is heuristic: the launcher polls for a
   leader-election lease. Controllers that do not use leader election need a
   custom readiness probe.

@@ -112,12 +112,16 @@ the same two-mode interface as rules_pg and rules_temporal.
 
 `_k8s_binary_repo` calls `rctx.download_and_extract` to fetch versioned
 `kube-apiserver` and `etcd` binaries. The canonical download source is the
-`envtest-bins` tarballs published by `sigs.k8s.io/controller-runtime` at:
+`envtest-bins` tarballs published by `kubernetes-sigs/controller-tools` at:
 
 ```
-https://storage.googleapis.com/kubebuilder-tools/
-    kubebuilder-tools-<k8s-version>-<os>-<arch>.tar.gz
+https://github.com/kubernetes-sigs/controller-tools/releases/download/
+    envtest-v<version>/envtest-v<version>-<os>-<arch>.tar.gz
 ```
+
+The tarball extracts to `controller-tools/envtest/` — `strip_prefix` is set to
+`"controller-tools/envtest"` so the binaries (`kube-apiserver`, `etcd`,
+`kubectl`) land at the repo root.
 
 SHA-256 checksums are stored in `_K8S_VERSIONS` in `extensions.bzl`.
 
@@ -126,9 +130,10 @@ SHA-256 checksums are stored in `_K8S_VERSIONS` in `extensions.bzl`.
 `_k8s_system_binary_repo` symlinks host-installed binaries into an external
 repo. Auto-detection at `bazel fetch` time:
 
-1. `command -v kube-apiserver` / `command -v etcd` — PATH lookup.
+1. `command -v kube-apiserver` — PATH lookup.
 2. Common locations: `/usr/local/kubebuilder/bin`, `/usr/local/bin`,
-   `/usr/bin`.
+   `/usr/bin`, and `$HOME/.local/kubebuilder/bin` (read from the repository
+   rule environment at fetch time).
 
 If either binary cannot be found, the build fails immediately with a clear error
 and a suggested install command (`setup-envtest use <version>`).
@@ -152,10 +157,9 @@ _bootstrap_tls(test_tmpdir)
   └── sign client cert with CA                     (client.crt)
 ```
 
-All files written to `$TEST_TMPDIR/pki/`. The launcher uses Python's
-`cryptography` library if available, falling back to `openssl` subprocess calls.
-The generated kubeconfig references these paths and is written to
-`$TEST_TMPDIR/kubeconfig`.
+All files written to `$TEST_TMPDIR/pki/`. The launcher uses `openssl`
+subprocess calls. The generated kubeconfig references these paths and is
+written to `$TEST_TMPDIR/kubeconfig`.
 
 `kube-apiserver` is started with:
 
@@ -273,6 +277,10 @@ Cleanup is handled by `atexit` handlers for `etcd_proc`, `apiserver_proc`, and
 | `KUBECONFIG`       | `$TEST_TMPDIR/kubeconfig`        | Path to per-test kubeconfig        |
 | `KUBE_NAMESPACE`   | `k8s-test-abc123def456`          | Isolated per-test namespace        |
 | `KUBE_API_SERVER`  | `https://127.0.0.1:54321`        | API server address                 |
+| `KUBECTL`          | `/path/to/kubectl`               | Absolute path to kubectl binary    |
+
+`KUBECTL` is set because `kubectl` is not on `$PATH` in the Bazel sandbox;
+test scripts must use `"$KUBECTL"` rather than relying on PATH.
 
 ---
 
@@ -324,7 +332,12 @@ signal.pause()
 KUBECONFIG=/tmp/.../kubeconfig
 KUBE_NAMESPACE=k8s-test-abc123def456
 KUBE_API_SERVER=https://127.0.0.1:54321
+KUBECTL=/path/to/kubectl
 ```
+
+`KUBECTL` is the absolute path to the kubectl binary used by the server. Tests
+that source this env file can use `"$KUBECTL"` directly without kubectl being
+in `$PATH`.
 
 ### `kubernetes_health_check`
 
