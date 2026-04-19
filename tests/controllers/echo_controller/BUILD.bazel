@@ -1,0 +1,7 @@
+py_binary(
+    name = "echo_controller_bin",
+    srcs = ["main.py"],
+    main = "main.py",
+    python_version = "PY3",
+    visibility = ["//tests:__pkg__"],
+)

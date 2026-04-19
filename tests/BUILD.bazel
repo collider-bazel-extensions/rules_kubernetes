@@ -1,0 +1,82 @@
+load("//:defs.bzl",
+    "kubernetes_controller",
+    "kubernetes_health_check",
+    "kubernetes_manifest",
+    "kubernetes_server",
+    "kubernetes_test",
+)
+
+# ---------------------------------------------------------------------------
+# Echo controller
+# ---------------------------------------------------------------------------
+
+kubernetes_controller(
+    name              = "echo_controller",
+    controller_binary = "//tests/controllers/echo_controller:echo_controller_bin",
+    ready_probe       = "env_file",
+)
+
+# ---------------------------------------------------------------------------
+# Manifest set for manifest_test
+# ---------------------------------------------------------------------------
+
+kubernetes_manifest(
+    name = "test_manifests",
+    srcs = ["manifests/test_clusterrole.yaml"],
+)
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+# Basic API server connectivity, namespace isolation, ConfigMap CRUD.
+kubernetes_test(
+    name = "apiserver_smoke_test",
+    srcs = ["apiserver_smoke_test.sh"],
+    size = "medium",
+)
+
+# Verify kubernetes_manifest applies YAML before the test binary runs.
+kubernetes_test(
+    name      = "manifest_test",
+    srcs      = ["manifest_test.sh"],
+    manifests = ":test_manifests",
+    size      = "medium",
+)
+
+# End-to-end controller test: echo_controller mirrors ConfigMaps.
+kubernetes_test(
+    name       = "controller_test",
+    srcs       = ["controller_test.sh"],
+    controller = ":echo_controller",
+    size       = "medium",
+)
+
+# ---------------------------------------------------------------------------
+# kubernetes_server lifecycle test
+# ---------------------------------------------------------------------------
+
+kubernetes_server(
+    name = "k8s_server_test_svc",
+)
+
+kubernetes_health_check(
+    name   = "k8s_server_test_health",
+    server = ":k8s_server_test_svc",
+)
+
+sh_test(
+    name = "kubernetes_server_test",
+    srcs = ["kubernetes_server_test.sh"],
+    args = ["$(rootpath :k8s_server_test_svc)"],
+    data = [":k8s_server_test_svc"],
+    size = "medium",
+)
+
+sh_test(
+    name = "kubernetes_health_check_test",
+    srcs = ["kubernetes_health_check_test.sh"],
+    args = ["$(rootpath :k8s_server_test_health)"],
+    data = [":k8s_server_test_health"],
+    size = "small",
+)
