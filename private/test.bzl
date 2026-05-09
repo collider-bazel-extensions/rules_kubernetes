@@ -1,5 +1,6 @@
 """kubernetes_test macro and _k8s_launcher_test rule."""
 
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
 load(":binary.bzl", "KubernetesBinaryInfo")
 load(":manifest.bzl", "KubernetesManifestInfo")
 load(":controller.bzl", "KubernetesControllerInfo")
@@ -181,8 +182,12 @@ def kubernetes_test(
                     (default native.sh_test).
         **kwargs:   Additional kwargs forwarded to test_rule.
     """
+    # Bazel 8+ removed `native.sh_test`, so the default has to load
+    # from rules_shell. Consumers can override `test_rule = ...` to
+    # point at another *_test rule (py_test, go_test, etc.) if they
+    # don't want rules_shell as a transitive dep.
     if test_rule == None:
-        test_rule = native.sh_test
+        test_rule = sh_test
 
     inner_name = name + "_inner"
 

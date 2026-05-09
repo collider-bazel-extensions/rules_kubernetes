@@ -1,10 +1,21 @@
 module(
     name = "rules_kubernetes",
-    version = "0.1.0",
+    version = "0.1.1",
 )
 
 bazel_dep(name = "bazel_skylib", version = "1.5.0")
 bazel_dep(name = "platforms", version = "0.0.9")
+
+# rules_shell is part of the public surface — `kubernetes_test`
+# defaults to `sh_test`. Bazel 8+ removed `native.sh_test`, so the
+# macro has to import it from rules_shell. Consumers transitively
+# need rules_shell unless they override `test_rule = ...`.
+bazel_dep(name = "rules_shell", version = "0.8.0")
+
+# rules_python is dev-only — used only by the in-tree
+# tests/controllers/echo_controller/BUILD.bazel (Bazel 8+ removed
+# native py_binary). Consumers don't inherit it.
+bazel_dep(name = "rules_python", version = "1.7.0", dev_dependency = True)
 
 kubernetes = use_extension("//:extensions.bzl", "kubernetes")
 kubernetes.system(versions = ["1.29"])
