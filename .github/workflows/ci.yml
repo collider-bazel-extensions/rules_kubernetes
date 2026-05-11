@@ -1,0 +1,53 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  # Hermetic mode (kubernetes.version()) — runner has NO host
+  # kube-apiserver / etcd / kubectl installed. Proves the envtest
+  # tarball fetch + extraction work end-to-end without any system
+  # prereqs. rules_kubernetes's own MODULE.bazel uses
+  # kubernetes.version() so the full test matrix runs hermetically.
+  #
+  # Mirror of rules_pg v0.4 + rules_spicedb v0.3 hermetic CI proofs.
+  hermetic:
+    name: bazel test (ubuntu-latest, hermetic kubernetes.version)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bazel-contrib/setup-bazel@0.15.0
+        with:
+          bazelisk-cache: true
+          disk-cache: ${{ github.workflow }}-hermetic
+          repository-cache: true
+
+      # Belt-and-suspenders: verify no host kube-apiserver / etcd /
+      # kubectl are on PATH at job start. If any are present, the
+      # hermetic test would silently fall back to them and we'd lose
+      # the proof.
+      - name: Verify NO host kube-apiserver/etcd/kubectl on PATH
+        run: |
+          set -euo pipefail
+          for bin in kube-apiserver etcd kubectl; do
+            if command -v "$bin" >/dev/null 2>&1; then
+              echo "FAIL: $bin found at $(command -v "$bin"); hermetic test would be meaningless" >&2
+              exit 1
+            fi
+          done
+          echo "OK — no host binaries; hermetic mode test is meaningful"
+
+      - name: bazel test //tests/...
+        run: bazel test //tests/... --test_output=errors
+
+      - name: Upload test logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bazel-testlogs-hermetic
+          path: bazel-testlogs/
+          if-no-files-found: ignore

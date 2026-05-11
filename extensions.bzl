@@ -1,8 +1,11 @@
 """Bzlmod module extension: fetch or symlink kube-apiserver + etcd + kubectl."""
 
-# Kubernetes versions and their envtest-bins tarball SHA-256 checksums.
-# Tarballs from: https://storage.googleapis.com/kubebuilder-tools/
-# linux_amd64 checksums are real; darwin values are placeholders.
+# Kubernetes versions + envtest-bins tarball sha256s.
+# Source: https://github.com/kubernetes-sigs/controller-tools/releases
+# (canonical post-2024; the older `storage.googleapis.com/kubebuilder-tools/`
+# bucket + `go.kubebuilder.io/test-tools/<ver>/<os>/<arch>` short URLs are
+# now 403'd). Tarball contains kube-apiserver + etcd + kubectl in
+# `kubebuilder/bin/`.
 _K8S_VERSIONS = {
     "1.29": {
         "linux_amd64": {
@@ -12,12 +15,12 @@ _K8S_VERSIONS = {
         },
         "darwin_arm64": {
             "url":          "https://github.com/kubernetes-sigs/controller-tools/releases/download/envtest-v1.29.0/envtest-v1.29.0-darwin-arm64.tar.gz",
-            "sha256":       "",  # placeholder: run tools/update_checksums.sh
+            "sha256":       "e2892acb96d4d62ea2015779a40a8b40f17ee446e6a55a07a24350b4c8bb778a",
             "strip_prefix": "controller-tools/envtest",
         },
         "darwin_amd64": {
             "url":          "https://github.com/kubernetes-sigs/controller-tools/releases/download/envtest-v1.29.0/envtest-v1.29.0-darwin-amd64.tar.gz",
-            "sha256":       "",  # placeholder: run tools/update_checksums.sh
+            "sha256":       "078ca8d08c31f5dba5f30d9be32d3e7688bd05636871f35f450d9e59ad167381",
             "strip_prefix": "controller-tools/envtest",
         },
     },
@@ -74,10 +77,15 @@ def _k8s_binary_repo_impl(rctx):
             "kubernetes.version() on this platform.".format(version, platform),
         )
 
+    # controller-tools' envtest tarballs strip-prefix to
+    # `controller-tools/envtest/` (not `kubebuilder/bin/` like the
+    # older GCS bucket). Pull the strip from the version entry so
+    # future tarballs from a different source can be wired without
+    # editing the rule.
     rctx.download_and_extract(
         url        = info["url"],
         sha256     = sha256,
-        stripPrefix = "kubebuilder",
+        stripPrefix = info["strip_prefix"],
     )
     rctx.file("BUILD.bazel", _BINARY_REPO_BUILD)
 

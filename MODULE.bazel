@@ -1,6 +1,6 @@
 module(
     name = "rules_kubernetes",
-    version = "0.2.0",
+    version = "0.3.0",
 )
 
 bazel_dep(name = "bazel_skylib", version = "1.5.0")
@@ -17,8 +17,13 @@ bazel_dep(name = "rules_shell", version = "0.8.0")
 # native py_binary). Consumers don't inherit it.
 bazel_dep(name = "rules_python", version = "1.7.0", dev_dependency = True)
 
+# v0.3: kubernetes.version() ships real shas for kube-apiserver +
+# etcd + kubectl tarballs from controller-tools' envtest releases.
+# Hermetic; no host install. rules_kubernetes's own MODULE.bazel uses
+# the version() mode so CI runs on bare ubuntu-latest. Consumers can
+# still opt into kubernetes.system() for host-managed installs.
 kubernetes = use_extension("//:extensions.bzl", "kubernetes")
-kubernetes.system(versions = ["1.29"])
+kubernetes.version(versions = ["1.29"])
 use_repo(kubernetes,
     "k8s_1_29_linux_amd64",
     "k8s_1_29_darwin_arm64",

@@ -42,12 +42,14 @@ bazel test //my/controller/...   # all tests run in parallel, fully isolated
 ### Bzlmod (`MODULE.bazel`)
 
 ```python
-bazel_dep(name = "rules_kubernetes", version = "0.2.0")
+bazel_dep(name = "rules_kubernetes", version = "0.3.0")
 
 kubernetes = use_extension("@rules_kubernetes//:extensions.bzl", "kubernetes")
 
-# Use the host-installed kube-apiserver + etcd (auto-detects from PATH):
-kubernetes.system(versions = ["1.29"])
+# v0.3+: kubernetes.version() fetches kube-apiserver + etcd + kubectl
+# hermetically from controller-tools' envtest releases. No host
+# install required.
+kubernetes.version(versions = ["1.29"])
 
 use_repo(kubernetes,
     "k8s_1_29_linux_amd64",
@@ -55,6 +57,8 @@ use_repo(kubernetes,
     "k8s_1_29_darwin_amd64",
 )
 ```
+
+Use `kubernetes.system(versions = [...])` instead if you want to reuse host-installed binaries (e.g. installed via `setup-envtest`). Both modes coexist per minor version; rules_kubernetes's own `MODULE.bazel` uses `kubernetes.version()` so CI runs on bare `ubuntu-latest`.
 
 ### WORKSPACE (legacy)
 
@@ -530,7 +534,5 @@ service_test(
 - **openssl required** for TLS certificate generation (present on all supported
   platforms).
 - **Windows not supported** (no pre-built binary source; PRs welcome).
-- **darwin tarball SHA-256 checksums are placeholders** in `extensions.bzl`.
-  Pin real values before using `kubernetes.version()` on macOS.
 - **Target name uniqueness** — two `kubernetes_server` targets with the same
   local name in different packages write to the same `$TEST_TMPDIR/<name>.env`.
