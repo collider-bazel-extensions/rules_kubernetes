@@ -371,9 +371,23 @@ def _kubectl(kubectl_bin, kubeconfig, *args):
 
 
 def _apply_manifests(kubectl_bin, kubeconfig, manifest_files):
+    # Server-side apply (--server-side) stores field-owner state on
+    # the apiserver instead of the legacy
+    # `kubectl.kubernetes.io/last-applied-configuration` annotation,
+    # which has a hard 256KB size limit. Many real-world CRDs
+    # (CNPG Cluster, Argo Workflows, etc.) exceed that limit and
+    # fail client-side apply with `metadata.annotations: Too long`.
+    # Server-side apply has been the recommended path since k8s 1.22
+    # and is GA — see https://kubernetes.io/docs/reference/using-api/server-side-apply/.
+    # `--force-conflicts` makes the rule the field manager
+    # unconditionally; rules_kubernetes is the source of truth for
+    # the manifests it applies, so taking over fields from a prior
+    # client-side apply is the right default.
     for path in manifest_files:
-        _log(f"applying: {os.path.basename(path)}")
-        r = _kubectl(kubectl_bin, kubeconfig, "apply", "-f", path)
+        _log(f"applying (server-side): {os.path.basename(path)}")
+        r = _kubectl(kubectl_bin, kubeconfig,
+                     "apply", "--server-side", "--force-conflicts",
+                     "-f", path)
         if r.returncode != 0:
             raise RuntimeError(
                 f"kubectl apply failed for {path}:\n{r.stdout}\n{r.stderr}")

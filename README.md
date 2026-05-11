@@ -42,7 +42,7 @@ bazel test //my/controller/...   # all tests run in parallel, fully isolated
 ### Bzlmod (`MODULE.bazel`)
 
 ```python
-bazel_dep(name = "rules_kubernetes", version = "0.1.0")
+bazel_dep(name = "rules_kubernetes", version = "0.2.0")
 
 kubernetes = use_extension("@rules_kubernetes//:extensions.bzl", "kubernetes")
 

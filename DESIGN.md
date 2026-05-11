@@ -410,6 +410,14 @@ complex readiness protocol. The base rules are useful without it.
 
 ---
 
+## Server-side apply (v0.2.0)
+
+`kubernetes_manifest`'s launcher applies each YAML via `kubectl apply --server-side --force-conflicts`. Server-side apply stores field-owner state on the apiserver rather than in the `kubectl.kubernetes.io/last-applied-configuration` annotation that client-side apply uses — that annotation has a hard 256KB size limit, so any single CRD whose encoded form exceeds it (CNPG `Cluster`, Argo Workflows full CRD set, etc.) fails client-side apply with `metadata.annotations: Too long`.
+
+Server-side apply is GA and recommended since k8s 1.22; envtest's apiserver fully supports it. `--force-conflicts` makes the rule the field manager unconditionally, which is the right default since rules_kubernetes is the source of truth for the manifests it applies — taking over fields from a prior client-side apply (or an earlier rules_kubernetes apply with a different field manager) is intended behavior.
+
+---
+
 ## Known limitations and non-goals
 
 - **No actual pod execution.** There is no kubelet. Pods never transition to
