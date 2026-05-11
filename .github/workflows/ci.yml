@@ -26,20 +26,23 @@ jobs:
           disk-cache: ${{ github.workflow }}-hermetic
           repository-cache: true
 
-      # Belt-and-suspenders: verify no host kube-apiserver / etcd /
-      # kubectl are on PATH at job start. If any are present, the
-      # hermetic test would silently fall back to them and we'd lose
-      # the proof.
-      - name: Verify NO host kube-apiserver/etcd/kubectl on PATH
+      # Belt-and-suspenders: verify no host kube-apiserver / etcd
+      # are on PATH at job start. If either is present, the hermetic
+      # test would silently fall back to it and we'd lose the proof.
+      # (kubectl is preinstalled on ubuntu-latest as a generic client
+      # — it's not the envtest-specific binary we care about, and
+      # rules_kubernetes ships its own kubectl in the envtest tarball
+      # regardless.)
+      - name: Verify NO host kube-apiserver/etcd on PATH
         run: |
           set -euo pipefail
-          for bin in kube-apiserver etcd kubectl; do
+          for bin in kube-apiserver etcd; do
             if command -v "$bin" >/dev/null 2>&1; then
               echo "FAIL: $bin found at $(command -v "$bin"); hermetic test would be meaningless" >&2
               exit 1
             fi
           done
-          echo "OK — no host binaries; hermetic mode test is meaningful"
+          echo "OK — no host kube-apiserver/etcd; hermetic mode test is meaningful"
 
       - name: bazel test //tests/...
         run: bazel test //tests/... --test_output=errors
