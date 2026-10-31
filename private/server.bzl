@@ -2,6 +2,7 @@
 
 load(":binary.bzl", "KubernetesBinaryInfo")
 load(":manifest.bzl", "KubernetesManifestInfo")
+load(":versions.bzl", "binary_label")
 
 # ---------------------------------------------------------------------------
 # JSON serialisation helpers
@@ -18,7 +19,7 @@ def _json_str_list(lst):
 # ---------------------------------------------------------------------------
 
 def _kubernetes_server_impl(ctx):
-    binary_info = ctx.attr._binary[KubernetesBinaryInfo]
+    binary_info = ctx.attr.binary[KubernetesBinaryInfo]
 
     manifest_short_paths = []
     manifest_info = ctx.attr.manifests
@@ -86,7 +87,7 @@ exec python3 "$RUNFILES_ROOT/{workspace}/{launcher_short}" "$@"
         runfiles   = rf,
     )]
 
-kubernetes_server = rule(
+_kubernetes_server = rule(
     doc = """\
 Long-running Kubernetes API server for multi-service integration tests.
 
@@ -105,9 +106,10 @@ Use with rules_itest:
             doc       = "Optional kubernetes_manifest to apply after the server starts.",
             providers = [KubernetesManifestInfo],
         ),
-        "_binary": attr.label(
-            doc       = "Platform-selected Kubernetes binary.",
-            default   = Label("//:k8s_default"),
+        "binary": attr.label(
+            doc       = "Platform-selected Kubernetes binary. Set by the " +
+                        "kubernetes_server macro from `k8s_version`.",
+            mandatory = True,
             providers = [KubernetesBinaryInfo],
         ),
         "_launcher": attr.label(
@@ -117,6 +119,24 @@ Use with rules_itest:
         ),
     },
 )
+
+def kubernetes_server(name, k8s_version = None, **kwargs):
+    """Long-running Kubernetes API server for rules_itest multi-service tests.
+
+    Starts etcd and kube-apiserver on dynamically allocated ports, applies
+    `manifests`, then writes $TEST_TMPDIR/<name>.env and blocks until SIGTERM.
+
+    Args:
+        name:        Target name (also the env file's base name).
+        k8s_version: Kubernetes minor version: "1.35" (default), "1.36",
+                     "1.37", or "1.29" (end of life).
+        **kwargs:    `manifests`, plus common attributes (tags, visibility, ...).
+    """
+    _kubernetes_server(
+        name   = name,
+        binary = binary_label(k8s_version, "kubernetes_server " + name),
+        **kwargs
+    )
 
 # ---------------------------------------------------------------------------
 # kubernetes_health_check

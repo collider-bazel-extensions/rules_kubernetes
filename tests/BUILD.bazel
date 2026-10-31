@@ -74,6 +74,26 @@ kubernetes_test(
 )
 
 # ---------------------------------------------------------------------------
+# Per-version API servers: k8s_version selects kube-apiserver/etcd/kubectl.
+# ---------------------------------------------------------------------------
+
+[
+    kubernetes_test(
+        name        = "k8s_{}_version_test".format(v.replace(".", "_")),
+        srcs        = ["k8s_version_test.sh"],
+        args        = [git_version],
+        k8s_version = v,
+        size        = "medium",
+    )
+    for v, git_version in [
+        ("1.29", "v1.29.0"),
+        ("1.35", "v1.35.0"),
+        ("1.36", "v1.36.2"),
+        ("1.37", "v1.37.0"),
+    ]
+]
+
+# ---------------------------------------------------------------------------
 # kubernetes_server lifecycle test
 # ---------------------------------------------------------------------------
 
@@ -98,6 +118,23 @@ kubernetes_server(
 kubernetes_health_check(
     name   = "k8s_server_manifest_health",
     server = ":k8s_server_manifest_svc",
+)
+
+# The same lifecycle checks against a server pinned with k8s_version.
+kubernetes_server(
+    name        = "k8s_server_1_29_svc",
+    k8s_version = "1.29",
+)
+
+sh_test(
+    name = "kubernetes_server_1_29_test",
+    srcs = ["kubernetes_server_test.sh"],
+    args = [
+        "$(rootpath :k8s_server_1_29_svc)",
+        "k8s_server_1_29_svc",
+    ],
+    data = [":k8s_server_1_29_svc"],
+    size = "medium",
 )
 
 sh_test(

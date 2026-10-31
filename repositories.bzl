@@ -7,10 +7,10 @@ Example WORKSPACE usage:
     load("@rules_kubernetes//:repositories.bzl", "kubernetes_system_dependencies")
 
     # Auto-detect kube-apiserver + etcd from PATH / common locations:
-    kubernetes_system_dependencies(versions = ["1.29"])
+    kubernetes_system_dependencies(versions = ["1.35"])
 
     # Or specify the directory explicitly:
-    # kubernetes_system_dependencies(versions = ["1.29"], bin_dir = "/usr/local/kubebuilder/bin")
+    # kubernetes_system_dependencies(versions = ["1.35"], bin_dir = "/usr/local/kubebuilder/bin")
 """
 
 load("//:extensions.bzl",
@@ -23,7 +23,7 @@ def kubernetes_system_dependencies(versions, bin_dir = ""):
     """Symlink host-installed kube-apiserver + etcd + kubectl into external repos.
 
     Args:
-        versions: list of Kubernetes minor version strings, e.g. ["1.29"].
+        versions: list of Kubernetes minor version strings, e.g. ["1.35"].
         bin_dir:  directory containing the binaries. Omit to auto-detect.
     """
     for version in versions:
@@ -37,10 +37,10 @@ def kubernetes_system_dependencies(versions, bin_dir = ""):
             )
 
 def kubernetes_dependencies(versions):
-    """Download kube-apiserver + etcd + kubectl tarballs from GCS.
+    """Download kube-apiserver + etcd + kubectl (controller-tools envtest releases).
 
     Args:
-        versions: list of Kubernetes minor version strings, e.g. ["1.29"].
+        versions: list of Kubernetes minor version strings, e.g. ["1.35"].
     """
     for version in versions:
         for platform in PLATFORMS:

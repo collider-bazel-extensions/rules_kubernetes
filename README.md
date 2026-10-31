@@ -42,30 +42,48 @@ bazel test //my/controller/...   # all tests run in parallel, fully isolated
 ### Bzlmod (`MODULE.bazel`)
 
 ```python
-bazel_dep(name = "rules_kubernetes", version = "0.3.0")
-
-kubernetes = use_extension("@rules_kubernetes//:extensions.bzl", "kubernetes")
-
-# v0.3+: kubernetes.version() fetches kube-apiserver + etcd + kubectl
-# hermetically from controller-tools' envtest releases. No host
-# install required.
-kubernetes.version(versions = ["1.29"])
-
-use_repo(kubernetes,
-    "k8s_1_29_linux_amd64",
-    "k8s_1_29_darwin_arm64",
-    "k8s_1_29_darwin_amd64",
-)
+bazel_dep(name = "rules_kubernetes", version = "0.4.0")
 ```
 
-Use `kubernetes.system(versions = [...])` instead if you want to reuse host-installed binaries (e.g. installed via `setup-envtest`). Both modes coexist per minor version; rules_kubernetes's own `MODULE.bazel` uses `kubernetes.version()` so CI runs on bare `ubuntu-latest`.
+That's all: kube-apiserver, etcd and kubectl are fetched hermetically from
+controller-tools' envtest releases for every supported version.
+
+`rules_kubernetes` declares `kubernetes.version()` for every supported
+version itself, so a module that only uses the downloaded binaries needs no
+extension tags at all. Declare tags to switch a version to host binaries
+(`kubernetes.system()`); the root module's tags win over rules_kubernetes's.
+
+```python
+# Optional: use host-installed binaries (e.g. from setup-envtest) for 1.35.
+kubernetes = use_extension("@rules_kubernetes//:extensions.bzl", "kubernetes")
+kubernetes.system(versions = ["1.35"])
+```
+
+### Kubernetes versions
+
+| `k8s_version` | Binaries (envtest release) | Notes |
+|---|---|---|
+| `"1.35"` | v1.35.0 | **default** |
+| `"1.36"` | v1.36.2 | |
+| `"1.37"` | v1.37.0 | |
+| `"1.29"` | v1.29.0 | end of life; default through v0.3.0 |
+
+Pick one per target with `k8s_version` on `kubernetes_test` and
+`kubernetes_server`; omitted, it's the default. The minors match
+[rules_kind](https://github.com/collider-bazel-extensions/rules_kind) v0.2.0,
+so envtest-level tests and kind clusters can run the same Kubernetes minor.
+The `//:k8s_<minor>` targets (e.g. `@rules_kubernetes//:k8s_1_35`) are also
+public.
+
+Changed in v0.4.0: the default moved from 1.29 to 1.35. Set
+`k8s_version = "1.29"` to keep the old API server.
 
 ### WORKSPACE (legacy)
 
 ```python
 load("@rules_kubernetes//:repositories.bzl", "kubernetes_system_dependencies")
 
-kubernetes_system_dependencies(versions = ["1.29"])
+kubernetes_system_dependencies(versions = ["1.35"])
 ```
 
 ### Getting the binaries
@@ -74,7 +92,7 @@ The easiest way is `setup-envtest` from `sigs.k8s.io/controller-runtime`:
 
 ```sh
 go install sigs.k8s.io/controller-runtime/tools/setup-envtest@latest
-setup-envtest use 1.29 --bin-dir ~/.local/kubebuilder/bin
+setup-envtest use 1.35 --bin-dir ~/.local/kubebuilder/bin
 ```
 
 `rules_kubernetes` auto-detects binaries from `$PATH` and common locations
@@ -414,7 +432,9 @@ kubernetes_test(
     size       = "medium",
     timeout    = None,
     tags       = [],
-    test_rule  = go_test,            # optional; default native.sh_test
+    test_rule  = go_test,            # optional; default rules_shell sh_test
+    k8s_version = "1.35",            # optional; "1.35" (default), "1.36", "1.37", "1.29"
+    args       = [...],              # optional; passed to the test binary
     **kwargs,
 )
 ```
@@ -423,14 +443,19 @@ Expands into two targets:
 - `<name>_inner` — the bare test binary (tagged `manual`).
 - `<name>` — the launcher wrapper that sets up the API server and exec's the inner binary.
 
+`args` and `env` go to the launcher, which passes them on to the inner
+binary. (Before v0.4.0 they were set on the `manual` inner target, where
+Bazel ignores them.) Other `**kwargs` go to the inner target.
+
 ### `kubernetes_server`
 
 Long-running API server for `rules_itest` multi-service integration tests.
 
 ```python
 kubernetes_server(
-    name      = "db_api_server",
-    manifests = ":crds",   # optional
+    name        = "db_api_server",
+    manifests   = ":crds",   # optional
+    k8s_version = "1.35",    # optional; "1.35" (default), "1.36", "1.37", "1.29"
 )
 
 kubernetes_health_check(
@@ -482,13 +507,15 @@ Two modes are available per version:
 | Mode | MODULE.bazel tag | WORKSPACE function | Description |
 |---|---|---|---|
 | System | `kubernetes.system()` | `kubernetes_system_dependencies()` | Symlinks host-installed binaries |
-| Download | `kubernetes.version()` | `kubernetes_dependencies()` | Downloads envtest tarballs from GitHub |
+| Download | `kubernetes.version()` | `kubernetes_dependencies()` | Downloads envtest tarballs from GitHub (rules_kubernetes declares this for every supported version) |
 
 Download tarballs come from
 `https://github.com/kubernetes-sigs/controller-tools/releases` — the same
 source as `setup-envtest`.
 
-Supported platforms: `linux_amd64`, `darwin_arm64`, `darwin_amd64`.
+Supported platforms: `linux_amd64`, `linux_arm64`, `darwin_arm64`,
+`darwin_amd64`. Every tarball is verified against controller-tools'
+published SHA-512 and pinned by SHA-256 (`tools/update_checksums.sh`).
 
 ---
 
