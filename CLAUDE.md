@@ -22,15 +22,18 @@ rules_kubernetes/
 ├── defs.bzl                  # Public API re-exports
 ├── extensions.bzl            # Module extension: k8s binary repos (download or system)
 ├── repositories.bzl          # Legacy WORKSPACE equivalents of extensions.bzl
-├── BUILD.bazel               # Platform config_settings + kubernetes_binary targets
+├── BUILD.bazel               # Platform config_settings + k8s_<minor> targets (generated from versions.bzl)
 ├── DESIGN.md                 # Architecture and design decisions
 ├── private/
 │   ├── binary.bzl            # kubernetes_binary rule + KubernetesBinaryInfo provider
+│   ├── versions.bzl          # SUPPORTED_VERSIONS, DEFAULT_VERSION, PLATFORMS, binary_label()
 │   ├── manifest.bzl          # kubernetes_manifest rule + KubernetesManifestInfo provider
 │   ├── controller.bzl        # kubernetes_controller rule + KubernetesControllerInfo provider
 │   ├── test.bzl              # kubernetes_test macro + _k8s_launcher_test rule
-│   ├── server.bzl            # kubernetes_server + kubernetes_health_check rules
+│   ├── server.bzl            # kubernetes_server macro (+ _kubernetes_server rule), kubernetes_health_check
 │   └── launcher.py           # Launcher: etcd → apiserver → manifests → controller → exec
+├── tools/
+│   └── update_checksums.sh   # Regenerate _K8S_VERSIONS (verifies published SHA-512, pins SHA-256)
 ├── toolchain/
 │   ├── toolchain.bzl         # Toolchain type + register helpers
 │   └── BUILD.bazel
@@ -41,6 +44,7 @@ rules_kubernetes/
     ├── controller_test.sh           # Controller reconcile loop end-to-end
     ├── kubernetes_server_test.sh    # kubernetes_server lifecycle test
     ├── kubernetes_health_check_test.sh  # kubernetes_health_check behavior test
+    ├── k8s_version_test.sh          # k8s_version: server gitVersion + kubectl minor
     └── controllers/
         └── echo_controller/        # Example controller for smoke tests
 ```
@@ -129,7 +133,13 @@ https://github.com/kubernetes-sigs/controller-tools/releases/download/
     envtest-v<version>/envtest-v<version>-<os>-<arch>.tar.gz
 ```
 
-Platforms supported: `linux_amd64`, `darwin_arm64`, `darwin_amd64`.
+Platforms supported: `linux_amd64`, `linux_arm64`, `darwin_arm64`, `darwin_amd64`.
+
+Versions: 1.35 (default), 1.36, 1.37, 1.29 (EOL) — `private/versions.bzl`.
+To add one: add the envtest release to `RELEASES` in
+`tools/update_checksums.sh` and run it, add the minor to `SUPPORTED_VERSIONS`,
+the `kubernetes.version()` tag and `use_repo` list in `MODULE.bazel`, and a
+`k8s_<minor>_version_test` entry in `tests/BUILD.bazel`.
 
 ### Analysis-time validation
 
@@ -210,14 +220,17 @@ kubernetes_test(
     size       = "medium",            # optional, default "medium"
     timeout    = None,                # optional
     tags       = [...],               # optional
-    test_rule  = go_test,             # optional; default native.sh_test
-    **kwargs,
+    test_rule  = go_test,             # optional; default rules_shell sh_test
+    k8s_version = "1.35",             # optional; default "1.35" (1.36, 1.37; EOL 1.29)
+    args       = [...],               # optional; launcher → test binary argv
+    **kwargs,                         # `args`/`env` go to the launcher; the rest to test_rule
 )
 
 # Long-running API server for rules_itest multi-service tests.
 kubernetes_server(
-    name      = "my_apiserver",
-    manifests = ":my_crds",           # optional
+    name        = "my_apiserver",
+    manifests   = ":my_crds",         # optional
+    k8s_version = "1.35",             # optional; default "1.35"
 )
 
 kubernetes_health_check(
@@ -238,24 +251,14 @@ kubernetes_health_check(
 ### MODULE.bazel (Bzlmod)
 
 ```python
-bazel_dep(name = "rules_kubernetes", version = "0.1.0")
+bazel_dep(name = "rules_kubernetes", version = "0.4.0")
 
+# Nothing else needed: rules_kubernetes declares kubernetes.version() for
+# every supported version. To use host binaries for a version instead
+# (root module tags win; each repo is created once):
 kubernetes = use_extension("@rules_kubernetes//:extensions.bzl", "kubernetes")
-
-# Use the host-installed kube-apiserver + etcd (auto-detects from PATH):
-kubernetes.system(versions = ["1.29"])
-
-# Or specify the path explicitly:
-# kubernetes.system(versions = ["1.29"], bin_dir = "/usr/local/kubebuilder/bin")
-
-# Or download pre-built tarballs:
-# kubernetes.version(versions = ["1.29"])
-
-use_repo(kubernetes,
-    "k8s_1_29_linux_amd64",
-    "k8s_1_29_darwin_arm64",
-    "k8s_1_29_darwin_amd64",
-)
+kubernetes.system(versions = ["1.35"])
+# kubernetes.system(versions = ["1.35"], bin_dir = "/usr/local/kubebuilder/bin")
 ```
 
 ### WORKSPACE (legacy)
@@ -263,7 +266,7 @@ use_repo(kubernetes,
 ```python
 load("@rules_kubernetes//:repositories.bzl", "kubernetes_system_dependencies")
 
-kubernetes_system_dependencies(versions = ["1.29"])
+kubernetes_system_dependencies(versions = ["1.35"])
 ```
 
 ## Development
@@ -276,9 +279,9 @@ bazel test //tests/...
 
 All tests must pass before any commit with code changes.
 
-### Test results (last full run: 2026-04-19)
+### Test results (last full run: 2026-10-30)
 
-All 7 tests pass on Linux x86_64 with Kubernetes 1.29 (envtest binaries).
+All 12 tests pass on Linux x86_64 (hermetic envtest binaries; default 1.35).
 
 | Test target                            | What it verifies                                                              | Result |
 |----------------------------------------|-------------------------------------------------------------------------------|--------|
@@ -288,7 +291,12 @@ All 7 tests pass on Linux x86_64 with Kubernetes 1.29 (envtest binaries).
 | `//tests:controller_manifest_test`     | kubernetes_controller with attached manifest: manifest applied + controller running | PASSED |
 | `//tests:server_manifest_test`         | kubernetes_server with manifests: manifest applied before env file written    | PASSED |
 | `//tests:kubernetes_server_test`       | kubernetes_server starts, writes env file, responds to SIGTERM                | PASSED |
+| `//tests:kubernetes_server_1_29_test`  | the same, with `kubernetes_server(k8s_version = "1.29")`                      | PASSED |
 | `//tests:kubernetes_health_check_test` | kubernetes_health_check exits non-zero without env file, 0 when present       | PASSED |
+| `//tests:k8s_1_29_version_test`        | `k8s_version = "1.29"`: server v1.29.0, kubectl 1.29; `args` reach the test   | PASSED |
+| `//tests:k8s_1_35_version_test`        | `k8s_version = "1.35"`: server v1.35.0, kubectl 1.35                          | PASSED |
+| `//tests:k8s_1_36_version_test`        | `k8s_version = "1.36"`: server v1.36.2, kubectl 1.36                          | PASSED |
+| `//tests:k8s_1_37_version_test`        | `k8s_version = "1.37"`: server v1.37.0, kubectl 1.37                          | PASSED |
 
 ### Launcher script
 

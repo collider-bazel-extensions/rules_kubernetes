@@ -12,7 +12,8 @@
 set -euo pipefail
 
 SERVER_BIN="$TEST_SRCDIR/$TEST_WORKSPACE/$1"
-ENV_FILE="$TEST_TMPDIR/k8s_server_test_svc.env"
+# $2: the kubernetes_server target name (the env file is <name>.env).
+ENV_FILE="$TEST_TMPDIR/${2:-k8s_server_test_svc}.env"
 SERVER_PID=""
 
 cleanup() {

@@ -4,6 +4,7 @@ load("@rules_shell//shell:sh_test.bzl", "sh_test")
 load(":binary.bzl", "KubernetesBinaryInfo")
 load(":manifest.bzl", "KubernetesManifestInfo")
 load(":controller.bzl", "KubernetesControllerInfo")
+load(":versions.bzl", "binary_label")
 
 # ---------------------------------------------------------------------------
 # JSON serialisation helpers (Bazel 6 has no json.encode)
@@ -20,7 +21,7 @@ def _json_str_list(lst):
 # ---------------------------------------------------------------------------
 
 def _k8s_launcher_impl(ctx):
-    binary_info = ctx.attr._binary[KubernetesBinaryInfo]
+    binary_info = ctx.attr.binary[KubernetesBinaryInfo]
 
     # Resolve optional controller and manifests.
     controller_info = None
@@ -131,9 +132,10 @@ _k8s_launcher_test = rule(
             doc       = "Optional kubernetes_manifest target (used when no controller is set).",
             providers = [KubernetesManifestInfo],
         ),
-        "_binary": attr.label(
-            doc      = "Platform-selected Kubernetes binary (kube-apiserver + etcd + kubectl).",
-            default  = Label("//:k8s_default"),
+        "binary": attr.label(
+            doc      = "Platform-selected Kubernetes binary (kube-apiserver + etcd + kubectl). " +
+                       "Set by the kubernetes_test macro from `k8s_version`.",
+            mandatory = True,
             providers = [KubernetesBinaryInfo],
         ),
         "_launcher": attr.label(
@@ -158,6 +160,7 @@ def kubernetes_test(
         timeout    = None,
         tags       = [],
         test_rule  = None,
+        k8s_version = None,
         **kwargs):
     """Run an isolated test against an ephemeral Kubernetes API server.
 
@@ -179,7 +182,9 @@ def kubernetes_test(
         timeout:    Test timeout.
         tags:       Tags forwarded to test_rule.
         test_rule:  The Bazel test rule to use for the inner binary
-                    (default native.sh_test).
+                    (default rules_shell's sh_test).
+        k8s_version: Kubernetes minor version of the API server: "1.35"
+                    (default), "1.36", "1.37", or "1.29" (end of life).
         **kwargs:   Additional kwargs forwarded to test_rule.
     """
     # Bazel 8+ removed `native.sh_test`, so the default has to load
@@ -190,6 +195,17 @@ def kubernetes_test(
         test_rule = sh_test
 
     inner_name = name + "_inner"
+
+    launcher_kwargs = {}
+    if timeout:
+        launcher_kwargs["timeout"] = timeout
+
+    # Bazel applies `args` and `env` only to the target it runs, which is
+    # the launcher; the launcher passes its argv and environment on to the
+    # inner binary. Given to the inner (manual) target they would be dropped.
+    for key in ["args", "env"]:
+        if key in kwargs:
+            launcher_kwargs[key] = kwargs.pop(key)
 
     # Build the inner test target (tagged manual — never run directly).
     inner_tags = list(tags) + ["manual"]
@@ -202,15 +218,13 @@ def kubernetes_test(
     )
 
     # Build the launcher wrapper.
-    launcher_kwargs = {}
-    if timeout:
-        launcher_kwargs["timeout"] = timeout
 
     _k8s_launcher_test(
         name       = name,
         test       = ":" + inner_name,
         controller = controller,
         manifests  = manifests,
+        binary     = binary_label(k8s_version, "kubernetes_test " + name),
         size       = size,
         tags       = tags,
         **launcher_kwargs
