@@ -1,4 +1,5 @@
 load("//private:binary.bzl", "kubernetes_binary", "kubernetes_binary_files")
+load("//private:tool.bzl", "kubernetes_tool")
 load("//private:versions.bzl", "DEFAULT_VERSION", "PLATFORMS", "SUPPORTED_VERSIONS")
 
 # ---------------------------------------------------------------------------
@@ -72,5 +73,27 @@ config_setting(
 alias(
     name       = "k8s_default",
     actual     = ":k8s_" + DEFAULT_VERSION.replace(".", "_"),
+    visibility = ["//visibility:public"],
+)
+
+# ---------------------------------------------------------------------------
+# Runnable kubectl per version: `bazel run @rules_kubernetes//:kubectl_1_35 -- ...`
+# runs that version's kubectl from the caller's directory. :kubectl is the
+# default version.
+# ---------------------------------------------------------------------------
+
+[
+    kubernetes_tool(
+        name = "kubectl_" + v.replace(".", "_"),
+        binary = ":k8s_" + v.replace(".", "_"),
+        tool = "kubectl",
+        visibility = ["//visibility:public"],
+    )
+    for v in SUPPORTED_VERSIONS
+]
+
+alias(
+    name       = "kubectl",
+    actual     = ":kubectl_" + DEFAULT_VERSION.replace(".", "_"),
     visibility = ["//visibility:public"],
 )

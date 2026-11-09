@@ -42,7 +42,7 @@ bazel test //my/controller/...   # all tests run in parallel, fully isolated
 ### Bzlmod (`MODULE.bazel`)
 
 ```python
-bazel_dep(name = "rules_kubernetes", version = "0.4.0")
+bazel_dep(name = "rules_kubernetes", version = "0.5.0")
 ```
 
 That's all: kube-apiserver, etcd and kubectl are fetched hermetically from
@@ -77,6 +77,23 @@ public.
 
 Changed in v0.4.0: the default moved from 1.29 to 1.35. Set
 `k8s_version = "1.29"` to keep the old API server.
+
+### Running kubectl at a pinned version
+
+`//:kubectl_<minor>` (`kubectl_1_29`, `kubectl_1_35`, `kubectl_1_36`,
+`kubectl_1_37`) runs that version's kubectl; `//:kubectl` is the default
+version (1.35). Arguments are forwarded, and the command runs from the
+directory you ran `bazel run` in, so relative paths work:
+
+```sh
+bazel run @rules_kubernetes//:kubectl_1_35 -- version --client
+bazel run @rules_kubernetes//:kubectl_1_35 -- apply -f ./manifests/app.yaml
+```
+
+They use the same binaries as `k8s_version` (downloaded, or the host's with
+`kubernetes.system()`), so a runbook gets the pinned kubectl without a host
+install. They also work as `data` of another target: the wrapper finds
+kubectl through `$0.runfiles` or `$RUNFILES_DIR`. (Added in v0.5.0.)
 
 ### WORKSPACE (legacy)
 
@@ -561,5 +578,10 @@ service_test(
 - **openssl required** for TLS certificate generation (present on all supported
   platforms).
 - **Windows not supported** (no pre-built binary source; PRs welcome).
+- **`bazel query @rules_kubernetes//...` needs the release archive.** The
+  in-tree tests load dev-only modules (`rules_python`), so `tests/` is left
+  out of the GitHub release tarball (`.gitattributes` `export-ignore`, since
+  v0.5.0). A `git_override` clones the repository with `tests/`, and `//...`
+  then fails to load; query `@rules_kubernetes//:all` instead.
 - **Target name uniqueness** — two `kubernetes_server` targets with the same
   local name in different packages write to the same `$TEST_TMPDIR/<name>.env`.

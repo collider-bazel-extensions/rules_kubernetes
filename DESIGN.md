@@ -174,6 +174,33 @@ version from those lists, each a `select()` over its four platform repos;
   the root module's tags first, so a root `kubernetes.system(["1.35"])`
   replaces the download for that version.
 
+### Runnable kubectl (v0.5)
+
+`//:kubectl_<minor>` is a `kubernetes_tool` (`private/tool.bzl`) over
+`//:k8s_<minor>`; `//:kubectl` aliases the default. `kubernetes_binary` stays
+a non-executable provider target: making it executable would have to pick
+one of its three binaries. `kubernetes_tool` writes a bash wrapper from
+`private/tool.sh.tmpl` whose only runfile is the chosen binary:
+
+- It finds the runfiles tree through `$0.runfiles` (`bazel run`, or a tool in
+  an action) or `$RUNFILES_DIR` (as `data` of a test), and makes it absolute
+  before changing directory.
+- It then changes to `$BUILD_WORKING_DIRECTORY` when set, so relative paths
+  in the arguments resolve from where `bazel run` was invoked rather than
+  from the runfiles tree, and `exec`s the binary.
+
+A plain symlink as the executable would run kubectl from the runfiles
+directory, where `-f ./x.yaml` doesn't resolve.
+
+### Release archive
+
+`.gitattributes` marks `tests/` `export-ignore`, so the GitHub tag tarball
+(what `archive_override` fetches) has no packages that load dev-only modules
+and `@rules_kubernetes//...` loads for consumers. `REPO.bazel`
+`ignore_directories` was not used: it applies when rules_kubernetes is the
+main repository too, which would hide `//tests/...` from its own CI.
+`git_override` clones the repository, `tests/` included.
+
 ---
 
 ## TLS bootstrap

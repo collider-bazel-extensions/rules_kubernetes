@@ -22,11 +22,14 @@ rules_kubernetes/
 ├── defs.bzl                  # Public API re-exports
 ├── extensions.bzl            # Module extension: k8s binary repos (download or system)
 ├── repositories.bzl          # Legacy WORKSPACE equivalents of extensions.bzl
-├── BUILD.bazel               # Platform config_settings + k8s_<minor> targets (generated from versions.bzl)
+├── BUILD.bazel               # Platform config_settings + k8s_<minor> / kubectl_<minor> targets (generated from versions.bzl)
+├── .gitattributes            # tests/ export-ignore: release tarball loads without dev deps
 ├── DESIGN.md                 # Architecture and design decisions
 ├── private/
 │   ├── binary.bzl            # kubernetes_binary rule + KubernetesBinaryInfo provider
 │   ├── versions.bzl          # SUPPORTED_VERSIONS, DEFAULT_VERSION, PLATFORMS, binary_label()
+│   ├── tool.bzl              # kubernetes_tool rule: runnable //:kubectl_<minor> wrappers
+│   ├── tool.sh.tmpl          # Wrapper: binary from runfiles, run from $BUILD_WORKING_DIRECTORY
 │   ├── manifest.bzl          # kubernetes_manifest rule + KubernetesManifestInfo provider
 │   ├── controller.bzl        # kubernetes_controller rule + KubernetesControllerInfo provider
 │   ├── test.bzl              # kubernetes_test macro + _k8s_launcher_test rule
@@ -45,6 +48,7 @@ rules_kubernetes/
     ├── kubernetes_server_test.sh    # kubernetes_server lifecycle test
     ├── kubernetes_health_check_test.sh  # kubernetes_health_check behavior test
     ├── k8s_version_test.sh          # k8s_version: server gitVersion + kubectl minor
+    ├── kubectl_run_test.sh          # //:kubectl_<minor>: version, relative paths from BUILD_WORKING_DIRECTORY
     └── controllers/
         └── echo_controller/        # Example controller for smoke tests
 ```
@@ -239,6 +243,17 @@ kubernetes_health_check(
 )
 ```
 
+Runnable kubectl at a pinned version (v0.5): `//:kubectl_<minor>` per
+`SUPPORTED_VERSIONS` and `//:kubectl` (default version), `kubernetes_tool`
+wrappers that forward arguments and run from `$BUILD_WORKING_DIRECTORY`:
+
+```sh
+bazel run @rules_kubernetes//:kubectl_1_35 -- apply -f ./app.yaml
+```
+
+`tests/` is `export-ignore`d (`.gitattributes`): the release tarball loads
+with `//...` for consumers even though the tests use dev-only `rules_python`.
+
 ### Environment variables injected into the test binary
 
 | Variable          | Example value             | Description                        |
@@ -251,7 +266,7 @@ kubernetes_health_check(
 ### MODULE.bazel (Bzlmod)
 
 ```python
-bazel_dep(name = "rules_kubernetes", version = "0.4.0")
+bazel_dep(name = "rules_kubernetes", version = "0.5.0")
 
 # Nothing else needed: rules_kubernetes declares kubernetes.version() for
 # every supported version. To use host binaries for a version instead
@@ -279,9 +294,9 @@ bazel test //tests/...
 
 All tests must pass before any commit with code changes.
 
-### Test results (last full run: 2026-10-30)
+### Test results (last full run: 2026-11-08)
 
-All 12 tests pass on Linux x86_64 (hermetic envtest binaries; default 1.35).
+All 13 tests pass on Linux x86_64 (hermetic envtest binaries; default 1.35).
 
 | Test target                            | What it verifies                                                              | Result |
 |----------------------------------------|-------------------------------------------------------------------------------|--------|
@@ -297,6 +312,7 @@ All 12 tests pass on Linux x86_64 (hermetic envtest binaries; default 1.35).
 | `//tests:k8s_1_35_version_test`        | `k8s_version = "1.35"`: server v1.35.0, kubectl 1.35                          | PASSED |
 | `//tests:k8s_1_36_version_test`        | `k8s_version = "1.36"`: server v1.36.2, kubectl 1.36                          | PASSED |
 | `//tests:k8s_1_37_version_test`        | `k8s_version = "1.37"`: server v1.37.0, kubectl 1.37                          | PASSED |
+| `//tests:kubectl_run_test`             | `//:kubectl_<minor>` and `//:kubectl` run the right kubectl minor; relative paths resolve from `BUILD_WORKING_DIRECTORY` | PASSED |
 
 ### Launcher script
 

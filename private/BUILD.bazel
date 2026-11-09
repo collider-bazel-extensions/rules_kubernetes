@@ -1,1 +1,1 @@
-exports_files(["launcher.py"])
+exports_files(["launcher.py", "tool.sh.tmpl"])
