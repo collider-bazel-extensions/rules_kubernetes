@@ -160,3 +160,27 @@ sh_test(
     data = [":k8s_server_manifest_svc"],
     size = "medium",
 )
+
+# ---------------------------------------------------------------------------
+# Runnable kubectl targets (//:kubectl_<v>, //:kubectl)
+# ---------------------------------------------------------------------------
+
+sh_test(
+    name = "kubectl_run_test",
+    srcs = ["kubectl_run_test.sh"],
+    args = [
+        "$(rootpath //:kubectl_1_29)", "29",
+        "$(rootpath //:kubectl_1_35)", "35",
+        "$(rootpath //:kubectl_1_36)", "36",
+        "$(rootpath //:kubectl_1_37)", "37",
+        "$(rootpath //:kubectl)", "35",
+    ],
+    data = [
+        "//:kubectl",
+        "//:kubectl_1_29",
+        "//:kubectl_1_35",
+        "//:kubectl_1_36",
+        "//:kubectl_1_37",
+    ],
+    size = "small",
+)

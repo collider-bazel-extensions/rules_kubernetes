@@ -54,3 +54,36 @@ jobs:
           name: bazel-testlogs-hermetic
           path: bazel-testlogs/
           if-no-files-found: ignore
+
+  # What a consumer sees: the tree `git archive` produces (the GitHub tag
+  # tarball, so tests/ is export-ignored) must load with //..., and
+  # `bazel run //:kubectl_<v>` must resolve relative paths from the caller.
+  consumer:
+    name: consumer (release archive, bazel run kubectl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bazel-contrib/setup-bazel@0.15.0
+        with:
+          bazelisk-cache: true
+          repository-cache: true
+      - name: Build a consumer over git archive HEAD
+        run: |
+          set -euo pipefail
+          arc="$RUNNER_TEMP/arc"; c="$RUNNER_TEMP/consumer"
+          mkdir -p "$arc" "$c/sub"
+          git archive HEAD | tar -x -C "$arc"
+          test ! -e "$arc/tests" || { echo "FAIL: tests/ is in the archive" >&2; exit 1; }
+          touch "$c/BUILD.bazel"
+          cat > "$c/MODULE.bazel" <<MOD
+          module(name = "consumer")
+          bazel_dep(name = "rules_kubernetes", version = "0.0.0")
+          local_path_override(module_name = "rules_kubernetes", path = "$arc")
+          MOD
+          echo from-the-caller > "$c/sub/payload.txt"
+          cd "$c"
+          bazel query @rules_kubernetes//... >/dev/null
+          cd sub
+          bazel run @rules_kubernetes//:kubectl_1_35 -- version --client | grep 'Client Version: v1.35'
+          bazel run @rules_kubernetes//:kubectl -- create configmap probe \
+              --from-file=./payload.txt --dry-run=client -o yaml | grep from-the-caller
