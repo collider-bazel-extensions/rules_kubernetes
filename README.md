@@ -42,7 +42,7 @@ bazel test //my/controller/...   # all tests run in parallel, fully isolated
 ### Bzlmod (`MODULE.bazel`)
 
 ```python
-bazel_dep(name = "rules_kubernetes", version = "0.5.0")
+bazel_dep(name = "rules_kubernetes", version = "0.6.0")
 ```
 
 That's all: kube-apiserver, etcd and kubectl are fetched hermetically from
@@ -402,7 +402,10 @@ load("@rules_kubernetes//:defs.bzl",
 ### `kubernetes_manifest`
 
 Declares YAML files (CRDs, RBAC, Namespaces) to apply before the controller
-starts and before the test binary runs.
+starts and before the test binary runs. Since v0.6.0 the launcher also waits
+until every CRD it applied is `Established`, so the controller and the test
+can create its custom resources at once, with no retry loop
+(`RULES_K8S_CRD_ESTABLISHED_TIMEOUT`, 30 s).
 
 ```python
 kubernetes_manifest(
@@ -462,7 +465,9 @@ Expands into two targets:
 
 `args` and `env` go to the launcher, which passes them on to the inner
 binary. (Before v0.4.0 they were set on the `manual` inner target, where
-Bazel ignores them.) Other `**kwargs` go to the inner target.
+Bazel ignores them. Before v0.6.0 `env` failed with "no such attribute".)
+Other `**kwargs` go to the inner target. `env` also takes the launcher's own
+settings (see [Tuning the launcher](#tuning-the-launcher)).
 
 ### `kubernetes_server`
 
@@ -514,6 +519,57 @@ These are set for every `kubernetes_test` invocation and written to the
 | `KUBECTL`         | `/path/to/kubectl`        | Absolute path to kubectl            |
 
 > `kubectl` is **not** on `$PATH` in the Bazel sandbox. Always use `"$KUBECTL"`.
+
+---
+
+## Tuning the launcher
+
+Set these with `--test_env` (Bazel passes a test only the variables it is
+asked to) or a target's `env`. An invalid value fails the launcher before it
+starts anything, with a message naming the variable.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `RULES_K8S_ETCD_READY_TIMEOUT` | `15` | Seconds etcd may take to answer `/health`. |
+| `RULES_K8S_APISERVER_READY_TIMEOUT` | `45` | Seconds kube-apiserver may take to answer `/readyz`. |
+| `RULES_K8S_CRD_ESTABLISHED_TIMEOUT` | `30` | Seconds the CRDs in your manifests may take to become `Established`. |
+| `RULES_K8S_ETCD_UNSAFE_NO_FSYNC` | `1` | `1`: etcd runs with `--unsafe-no-fsync`; `0`: etcd fsyncs as usual. |
+| `RULES_K8S_MAX_SERVERS` | usable CPUs, at least 2 | API servers (etcd + kube-apiserver) that may run at once, across every Bazel server of the user; `0` = no limit. |
+| `RULES_K8S_SLOT_DIR` | `/dev/shm/rules_kubernetes-<uid>/slots` | Slot lock files for `RULES_K8S_MAX_SERVERS`. |
+| `RULES_K8S_MIN_FREE_MB` | unset | After taking a slot, also wait until `MemAvailable` reaches this. |
+
+```sh
+bazel test //... --test_env=RULES_K8S_APISERVER_READY_TIMEOUT=120 --test_env=RULES_K8S_MAX_SERVERS=8
+```
+
+**Readiness timeouts.** On a loaded host, kube-apiserver can take well over
+the usual 3–7 s to become ready. The timeouts cover startup only; the wait
+for a slot does not count against them.
+
+**`--unsafe-no-fsync`.** etcd's data lives in `$TEST_TMPDIR` and is thrown
+away with the test, so etcd skips fsync by default. That removes the fsync
+stalls behind `etcdserver: request timed out` while manifests are applied on
+a busy disk. Every etcd that `kubernetes.version()` downloads (3.5 and later)
+has the flag. With `kubernetes.system()` and an older etcd, the launcher
+leaves the flag out and logs that it did.
+
+**Concurrent servers.** `--local_resources` and `--jobs` limit one Bazel
+server. Several worktrees, or a Bazel server next to kind clusters, can still
+start dozens of API servers at once. Before it bootstraps TLS, each launcher
+therefore takes one of `RULES_K8S_MAX_SERVERS` slots. A slot is a file locked
+with `flock`. The lock is held by the launcher (in `kubernetes_test`, by the
+test binary it execs into) and by its etcd and kube-apiserver. The slot is
+free again once all of them have exited, SIGKILL included. A waiting launcher
+logs the holders' targets once a minute. The wait has no timeout of its own:
+it counts against the test's timeout (and a `health_check_timeout`, if the
+`itest_service` sets one). The default allows as many servers as one Bazel
+server runs tests at once (`--local_test_jobs` defaults to the CPU count), so
+a single Bazel server is not slowed down. The slot directory is in
+`/dev/shm` because Bazel's Linux sandbox leaves it writable and shared,
+while `$XDG_RUNTIME_DIR` is read-only inside the sandbox. It is per user.
+Point several users at one shared directory (for example
+`mkdir -m 1777 /var/tmp/rules_kubernetes-slots`, plus
+`--sandbox_writable_path` for it) to share the limit across them.
 
 ---
 
@@ -574,7 +630,12 @@ service_test(
 
 - **No pod execution.** There is no kubelet. Pods never reach `Running` without
   a simulator like [kwok](https://kwok.sigs.k8s.io) (planned for Phase 2).
-- **`~3–6 s` overhead per test** for etcd + apiserver startup.
+- **`~3–6 s` overhead per test** for etcd + apiserver startup, plus any wait
+  for a server slot (`RULES_K8S_MAX_SERVERS`).
+- **The server limit is per user by default** and verified on Linux. On
+  macOS the slot directory falls back to `$XDG_RUNTIME_DIR` or the temp
+  directory, which the macOS sandbox may keep per test; set
+  `RULES_K8S_SLOT_DIR`, or `RULES_K8S_MAX_SERVERS=0`.
 - **openssl required** for TLS certificate generation (present on all supported
   platforms).
 - **Windows not supported** (no pre-built binary source; PRs welcome).

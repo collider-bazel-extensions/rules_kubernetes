@@ -305,15 +305,17 @@ allocate TCP ports for kube-apiserver (API) and etcd (peer + client)
   ↓
 generate UUID namespace  (k8s-test-<12-hex>)
   ↓
+take a server slot (RULES_K8S_MAX_SERVERS; see Launcher budgets and admission)
+  ↓
 _bootstrap_tls()  → $TEST_TMPDIR/pki/ + $TEST_TMPDIR/kubeconfig
   ↓
-start etcd  [retry on port conflict, up to 5 attempts]
+start etcd  [--unsafe-no-fsync by default; retry on port conflict, up to 5 attempts]
   ↓
-_wait_etcd_ready: TCP open + etcd health endpoint (15 s timeout)
+_wait_etcd_ready: TCP open + etcd health endpoint (RULES_K8S_ETCD_READY_TIMEOUT, 15 s)
   ↓
 start kube-apiserver  [retry on port conflict]
   ↓
-_wait_apiserver_ready: TCP open + /readyz HTTP check (30 s timeout)
+_wait_apiserver_ready: TCP open + /readyz HTTP check (RULES_K8S_APISERVER_READY_TIMEOUT, 45 s)
   ↓
 kubectl apply manifests in order (if kubernetes_manifest provided)
   ↓
@@ -328,7 +330,9 @@ os.execve(test_binary, env={KUBECONFIG, KUBE_NAMESPACE, KUBE_API_SERVER})
 ```
 
 Cleanup is handled by `atexit` handlers for `etcd_proc`, `apiserver_proc`, and
-`controller_proc`. Bazel removes `$TEST_TMPDIR` after each test run.
+`controller_proc`. Bazel removes `$TEST_TMPDIR` after each test run. The
+server slot's fd survives the `execve`, so the test binary, etcd and
+kube-apiserver hold the slot until they have all exited.
 
 ### Environment variables injected
 
@@ -475,6 +479,112 @@ complex readiness protocol. The base rules are useful without it.
 `kubernetes_manifest`'s launcher applies each YAML via `kubectl apply --server-side --force-conflicts`. Server-side apply stores field-owner state on the apiserver rather than in the `kubectl.kubernetes.io/last-applied-configuration` annotation that client-side apply uses — that annotation has a hard 256KB size limit, so any single CRD whose encoded form exceeds it (CNPG `Cluster`, Argo Workflows full CRD set, etc.) fails client-side apply with `metadata.annotations: Too long`.
 
 Server-side apply is GA and recommended since k8s 1.22; envtest's apiserver fully supports it. `--force-conflicts` makes the rule the field manager unconditionally, which is the right default since rules_kubernetes is the source of truth for the manifests it applies — taking over fields from a prior client-side apply (or an earlier rules_kubernetes apply with a different field manager) is intended behavior.
+
+---
+
+## Launcher budgets and admission (v0.6, #5)
+
+Under host load (a 16-core host at load 100–600 running kind clusters and
+several Bazel servers), envtests failed for three separate reasons. Each has
+its own knob, read by `_load_config()` before the launcher reads its manifest.
+An invalid value is a `ConfigError`: the launcher prints
+`[rules_kubernetes] ERROR: <VAR>='<value>': expected …` and exits 1, with no
+traceback and before anything starts. A typo in a budget therefore fails the
+test instead of silently running with the default.
+
+### Readiness timeouts
+
+`RULES_K8S_ETCD_READY_TIMEOUT` (15 s) and `RULES_K8S_APISERVER_READY_TIMEOUT`
+(45 s) replace the constants in `_wait_etcd_ready` and
+`_wait_apiserver_ready`. The values are positive, finite seconds; fractions
+are allowed. The defaults are unchanged. Measured on v0.4.0: apiserver ready
+in 3.4–7 s at load 25–36, and 13.8–17.5 s with 24 starting at once at load
+80–106. 45 s already covers that. The knob is for hosts that are worse
+still, and the timeout message names the variable. The slot wait (below)
+comes before these clocks start, so it never counts against them.
+
+### etcd `--unsafe-no-fsync`: on by default
+
+`RULES_K8S_ETCD_UNSAFE_NO_FSYNC` defaults to `1`; `0` opts out.
+
+- **Why it is safe.** fsync only matters when a crash must leave the data
+  dir recoverable. The data dir is `$TEST_TMPDIR/etcd_data`. It belongs to
+  one test, is never reopened, and Bazel deletes it. If etcd or the host
+  crashes, the test fails either way.
+- **Why the default.** The failure it fixes, `etcdserver: request timed out`
+  during `_apply_manifests`, happens after readiness, so no timeout can
+  absorb it. It shows up exactly on the loaded hosts where nobody thought to
+  set an opt-in. Every envtest etcd that `kubernetes.version()` downloads has
+  the flag (checked with `etcd --help`: 3.5.10 for 1.29, 3.6.6 / 3.6.8 /
+  3.7.0 for 1.35 / 1.36 / 1.37; the flag arrived in etcd 3.5.0).
+- **Older etcd.** A `kubernetes.system()` etcd may be older and would
+  refuse the unknown flag. When the flag is wanted, `_etcd_extra_flags` runs
+  `etcd --help` once per launch and adds `--unsafe-no-fsync` only if the help
+  text lists it. Otherwise it logs that etcd runs with fsync.
+- **Why an opt-out.** It is there for anyone who wants etcd's normal
+  durability path under test, for example while debugging etcd itself.
+
+### Admission: `RULES_K8S_MAX_SERVERS`
+
+This follows rules_kind v0.3.0's cluster slots (`RULES_KIND_MAX_CLUSTERS`).
+A launcher takes one of `RULES_K8S_MAX_SERVERS` slots before the TLS
+bootstrap: `slot-<i>` files in `RULES_K8S_SLOT_DIR`, each locked with a
+non-blocking `flock` and polled every second. The TLS bootstrap is four RSA
+key generations, CPU work that a loaded host should also queue. The holder
+writes its pid and `$TEST_TARGET` into the slot file. A waiting launcher logs
+those holders once a minute. The pid is as seen inside the holder's sandbox
+PID namespace. Slot files are mode 0666, so a directory shared between users
+works. With `RULES_K8S_MIN_FREE_MB`, the launcher also waits, after taking
+the slot, until `MemAvailable` in `/proc/meminfo` reaches that value. The
+wait has no timeout of its own; the test's timeout bounds it.
+
+Where the design departs from rules_kind:
+
+- **Who holds the lock.** rules_kind keeps its slot fd private to the
+  launcher, which lives as long as the cluster. Here, test mode `execve`s
+  into the test binary, and Python opens fds close-on-exec, so a private fd
+  would free the slot just as the test starts. The slot fd is therefore made
+  inheritable. It survives the `execve`, and it is passed (`pass_fds`) to
+  etcd and kube-apiserver, the processes the limit is about. A flock is
+  released when the last fd on it closes. So the slot stays taken until the
+  launcher (or the test binary), etcd and kube-apiserver have all exited, by
+  any means, SIGKILL included. A server that outlives its test still counts.
+  The controller subprocess does not get the fd (the default
+  `close_fds=True`); it is not a server.
+- **Default directory: `/dev/shm/rules_kubernetes-<uid>/slots`, not
+  `$XDG_RUNTIME_DIR`.** rules_kind's tests run unsandboxed, because they
+  need a container runtime. rules_kubernetes tests normally run in
+  `linux-sandbox`. Inside it, `/run/user/<uid>` is mounted read-only and
+  `/tmp` is private to the test (verified with Bazel 9.3). `/dev/shm` is the
+  host-shared directory that Bazel leaves writable. Every launcher of every
+  Bazel server, sandboxed or not, therefore meets in the same directory. The
+  parent directory is created 0700. Because `/dev/shm` is world-writable,
+  the launcher refuses a parent directory that another user owns or that
+  others can write. Without `/dev/shm` (macOS), the default is
+  `$XDG_RUNTIME_DIR/rules_kubernetes`, else the temp directory. If the
+  directory cannot be created, the error names `RULES_K8S_SLOT_DIR`,
+  `--sandbox_writable_path` and `RULES_K8S_MAX_SERVERS=0`.
+- **Default limit: the usable CPU count (`sched_getaffinity`), at least
+  2.** rules_kind defaults to 2 because a kind cluster costs gigabytes. An
+  envtest server costs a few hundred MB and mostly idles after startup.
+  Bazel's `--local_test_jobs` also defaults to the CPU count, so one Bazel
+  server alone is never throttled by the default. That keeps the default
+  behavior for the common case, while N Bazel servers together are held to
+  one server's worth of API servers instead of N times as many. Hosts that
+  need more or less set the variable; `0` turns the limit off.
+- **Invalid values fail** rather than fall back to the default with a
+  warning (rules_kind's behavior), consistent with the timeouts above.
+
+**CRDs are Established before anything uses them** (#5, item 4).
+`_apply_manifests` returns the CRD names from `kubectl apply`'s
+`customresourcedefinition.apiextensions.k8s.io/<name> ...` lines, and
+`_wait_crds_established` polls each with `kubectl get crd -o jsonpath=` for
+`Established=True` before the namespace, controller or test start. Polling
+rather than `kubectl wait --for=condition=Established`, which exits 1 ("<nil>
+is of the type <nil>") while a CRD has no conditions yet: that is why
+consumers carried their own retry loops. Budget
+`RULES_K8S_CRD_ESTABLISHED_TIMEOUT` (30 s); manifests without CRDs skip the
+wait.
 
 ---
 

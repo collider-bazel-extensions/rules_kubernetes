@@ -7,7 +7,8 @@
 # The kubernetes_test target that wraps this script is configured with:
 #   manifests = ":test_manifests"
 # which applies tests/manifests/test_clusterrole.yaml — a ClusterRole named
-# "rules-k8s-test-reader".
+# "rules-k8s-test-reader" — and tests/manifests/test_crd.yaml, a CRD the
+# launcher waits to be Established before the test starts (#5).
 
 set -euo pipefail
 
@@ -53,3 +54,23 @@ fi
 
 echo ""
 echo "--- PASS ---"
+
+# -------------------------------------------------------------------------
+# The CRD is Established before the test starts (#5): no retry loop needed.
+# -------------------------------------------------------------------------
+
+echo ""
+echo "Checking that CRD widgets.rules-k8s.test is Established..."
+established="$("$KUBECTL" get crd widgets.rules-k8s.test --kubeconfig "$KUBECONFIG" \
+    -o 'jsonpath={.status.conditions[?(@.type=="Established")].status}')"
+[[ "$established" == "True" ]] || { echo "FAIL: CRD not Established at test start ($established)" >&2; exit 1; }
+cat <<YAML | "$KUBECTL" apply --kubeconfig "$KUBECONFIG" -n "$KUBE_NAMESPACE" -f - >/dev/null
+apiVersion: rules-k8s.test/v1
+kind: Widget
+metadata:
+  name: first
+spec:
+  size: 3
+YAML
+"$KUBECTL" get widget first --kubeconfig "$KUBECONFIG" -n "$KUBE_NAMESPACE" >/dev/null
+echo "OK: CRD Established; a Widget was created without retrying"

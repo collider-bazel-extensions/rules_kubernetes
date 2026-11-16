@@ -6,11 +6,33 @@ RULES_K8S_MODE=test   (default): etcd → apiserver → manifests → namespace
                                    → controller → wait → execve(test_binary)
 RULES_K8S_MODE=server:            etcd → apiserver → manifests → namespace
                                    → write env file → signal.pause()
+
+Tuning (environment; invalid values fail the launcher before anything starts):
+  RULES_K8S_ETCD_READY_TIMEOUT       seconds etcd may take to answer /health (15)
+  RULES_K8S_APISERVER_READY_TIMEOUT  seconds kube-apiserver may take to answer
+                                     /readyz (45)
+  RULES_K8S_ETCD_UNSAFE_NO_FSYNC     1 (default): etcd runs with
+                                     --unsafe-no-fsync, the data is thrown away
+                                     anyway; 0: etcd fsyncs as usual
+  RULES_K8S_CRD_ESTABLISHED_TIMEOUT  seconds the CRDs in the manifests may take
+                                     to become Established (30)
+
+Admission:
+  At most RULES_K8S_MAX_SERVERS (default: the number of usable CPUs, at least
+  2; 0 = no limit) launchers per user run an etcd + kube-apiserver at once,
+  across Bazel servers: each holds a flock on a slot file under
+  RULES_K8S_SLOT_DIR (default /dev/shm/rules_kubernetes-<uid>/slots, which
+  Bazel's linux-sandbox leaves writable) from before the TLS bootstrap until
+  the launcher, etcd and kube-apiserver have all exited. In test mode the lock
+  survives the execve into the test binary. Optionally RULES_K8S_MIN_FREE_MB
+  waits for MemAvailable.
 """
 
 import atexit
 import dataclasses
+import fcntl
 import json
+import math
 import os
 import signal
 import socket
@@ -85,6 +107,24 @@ def _allocate_port():
         return s.getsockname()[1]
 
 
+def _stop_proc(proc, grace=5):
+    """SIGTERM, then SIGKILL after `grace` seconds; wait for the exit.
+
+    Registered with atexit for etcd, kube-apiserver and the controller.
+    kube-apiserver's graceful shutdown can take minutes on a loaded host
+    (more so once etcd is gone), and the server slot stays taken until it
+    exits; the data is thrown away, so there is nothing to shut down
+    gracefully for."""
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
 def _is_port_conflict(log_file):
     """Return True if the log file mentions an address-already-in-use error."""
     try:
@@ -92,6 +132,226 @@ def _is_port_conflict(log_file):
             return "address already in use" in f.read().lower()
     except FileNotFoundError:
         return False
+
+
+# ---------------------------------------------------------------------------
+# Configuration from the environment
+# ---------------------------------------------------------------------------
+
+class ConfigError(ValueError):
+    """An invalid RULES_K8S_* setting; reported without a traceback."""
+
+
+_DEFAULT_ETCD_READY_TIMEOUT      = 15
+_DEFAULT_APISERVER_READY_TIMEOUT = 45
+_DEFAULT_CRD_ESTABLISHED_TIMEOUT = 30
+
+
+def _env_seconds(name, default):
+    """A positive, finite number of seconds from `name`, or `default` when
+    unset or empty."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        value = None
+    if value is None or not math.isfinite(value) or value <= 0:
+        raise ConfigError(
+            f"{name}={raw!r}: expected a positive number of seconds "
+            f"(default {default})")
+    return value
+
+
+def _env_count(name, default):
+    """A non-negative integer from `name`, or `default` when unset or empty."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        value = -1
+    if value < 0:
+        raise ConfigError(
+            f"{name}={raw!r}: expected a non-negative integer (default {default})")
+    return value
+
+
+def _env_bool(name, default):
+    """'1' or '0' from `name`, or `default` when unset or empty."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    if raw not in ("0", "1"):
+        raise ConfigError(f"{name}={raw!r}: expected 1 or 0")
+    return raw == "1"
+
+
+def _default_max_servers():
+    """The number of CPUs this process may run on, at least 2: as many as
+    one Bazel server runs tests at once by default (--local_test_jobs), so a
+    single Bazel server is never held back, while several together are."""
+    try:
+        cpus = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        cpus = os.cpu_count() or 1
+    return max(2, cpus)
+
+
+@dataclasses.dataclass
+class _Config:
+    etcd_ready_timeout:      float
+    apiserver_ready_timeout: float
+    crd_established_timeout: float
+    etcd_unsafe_no_fsync:    bool
+    max_servers:             int
+    min_free_mb:             int
+
+
+def _load_config():
+    """Read every RULES_K8S_* tuning variable; raise ConfigError on the
+    first invalid one."""
+    return _Config(
+        etcd_ready_timeout = _env_seconds(
+            "RULES_K8S_ETCD_READY_TIMEOUT", _DEFAULT_ETCD_READY_TIMEOUT),
+        apiserver_ready_timeout = _env_seconds(
+            "RULES_K8S_APISERVER_READY_TIMEOUT", _DEFAULT_APISERVER_READY_TIMEOUT),
+        crd_established_timeout = _env_seconds(
+            "RULES_K8S_CRD_ESTABLISHED_TIMEOUT", _DEFAULT_CRD_ESTABLISHED_TIMEOUT),
+        etcd_unsafe_no_fsync = _env_bool("RULES_K8S_ETCD_UNSAFE_NO_FSYNC", True),
+        max_servers = _env_count("RULES_K8S_MAX_SERVERS", _default_max_servers()),
+        min_free_mb = _env_count("RULES_K8S_MIN_FREE_MB", 0),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Admission: a per-user limit on concurrent API servers
+# ---------------------------------------------------------------------------
+
+def _slot_dir():
+    """RULES_K8S_SLOT_DIR, or /dev/shm/rules_kubernetes-<uid>/slots.
+
+    /dev/shm because it is the one host-shared directory that Bazel's
+    linux-sandbox leaves writable (it mounts $XDG_RUNTIME_DIR read-only and
+    gives each test a private /tmp), so sandboxed and unsandboxed launchers
+    of every Bazel server meet in the same directory. Elsewhere (macOS) the
+    default is $XDG_RUNTIME_DIR, else the temp dir. Point several users at
+    one directory (e.g. a mode-1777 one) to share the limit across them."""
+    d = os.environ.get("RULES_K8S_SLOT_DIR")
+    shared = bool(d)
+    if not d:
+        uid = os.getuid()
+        if os.path.isdir("/dev/shm"):
+            base = os.path.join("/dev/shm", f"rules_kubernetes-{uid}")
+        else:
+            runtime_dir = os.environ.get("XDG_RUNTIME_DIR") or ""
+            if runtime_dir and os.path.isdir(runtime_dir):
+                base = os.path.join(runtime_dir, "rules_kubernetes")
+            else:
+                base = os.path.join(tempfile.gettempdir(), f"rules_kubernetes-{uid}")
+        try:
+            os.makedirs(base, mode=0o700, exist_ok=True)
+            st = os.stat(base)
+        except OSError as e:
+            raise RuntimeError(
+                f"cannot create the server slot directory {base}: {e}\n"
+                "Set RULES_K8S_SLOT_DIR to a directory the test can write "
+                "(and --sandbox_writable_path=<it> when sandboxed), or "
+                "RULES_K8S_MAX_SERVERS=0 to turn the limit off.") from e
+        # /dev/shm is world-writable: don't use another user's directory.
+        if st.st_uid != uid or st.st_mode & 0o022:
+            raise RuntimeError(
+                f"server slot directory {base} is not owned by uid {uid} "
+                "or is writable by others; remove it, or set "
+                "RULES_K8S_SLOT_DIR")
+        d = os.path.join(base, "slots")
+    try:
+        os.makedirs(d, mode=0o777 if shared else 0o700, exist_ok=True)
+    except OSError as e:
+        raise RuntimeError(
+            f"cannot create the server slot directory {d}: {e}\n"
+            "Set RULES_K8S_SLOT_DIR to a directory the test can write "
+            "(and --sandbox_writable_path=<it> when sandboxed), or "
+            "RULES_K8S_MAX_SERVERS=0 to turn the limit off.") from e
+    return d
+
+
+def _acquire_slot(limit, target):
+    """Block until one of `limit` slots is free and return its fd, or None
+    when limit is 0 (no limit).
+
+    The fd is inheritable: it survives the launcher's execve into the test
+    binary, and _start_etcd/_start_apiserver pass it to etcd and
+    kube-apiserver, so the slot stays taken until every one of them has
+    exited (the kernel drops a flock when its last fd closes, SIGKILL
+    included). The wait has no timeout of its own; the test's timeout
+    bounds it."""
+    if limit <= 0:
+        return None
+    d = _slot_dir()
+    last_report = None
+    while True:
+        holders = []
+        for i in range(limit):
+            path = os.path.join(d, f"slot-{i}")
+            fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o666)
+            try:
+                # Lockable by every user sharing RULES_K8S_SLOT_DIR (the
+                # default directory is private to the user anyway).
+                os.fchmod(fd, 0o666)
+            except OSError:
+                pass  # created by another user
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                try:
+                    holders.append(os.read(fd, 4096).decode(errors="replace").strip())
+                except OSError:
+                    pass
+                os.close(fd)
+                continue
+            os.ftruncate(fd, 0)
+            os.write(fd, f"pid {os.getpid()} target {target} "
+                         f"since {time.strftime('%H:%M:%S')}".encode())
+            os.set_inheritable(fd, True)
+            _log(f"server slot {i + 1}/{limit} acquired")
+            return fd
+        now = time.monotonic()
+        if last_report is None or now - last_report >= 60:
+            _log(f"waiting for a server slot (RULES_K8S_MAX_SERVERS={limit}); "
+                 "held by: " + "; ".join(h or "?" for h in holders))
+            last_report = now
+        time.sleep(1)
+
+
+def _mem_available_mb():
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) // 1024
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _wait_free_memory(want):
+    """With RULES_K8S_MIN_FREE_MB set, wait until MemAvailable reaches it."""
+    if want <= 0:
+        return
+    last_report = None
+    while True:
+        have = _mem_available_mb()
+        if have is None or have >= want:
+            return
+        now = time.monotonic()
+        if last_report is None or now - last_report >= 60:
+            _log(f"waiting for memory: {have} MB available, "
+                 f"RULES_K8S_MIN_FREE_MB={want}")
+            last_report = now
+        time.sleep(5)
 
 
 # ---------------------------------------------------------------------------
@@ -203,7 +463,7 @@ def _make_ssl_ctx(pki_dir):
 # etcd
 # ---------------------------------------------------------------------------
 
-def _wait_etcd_ready(port, log_file, timeout=15):
+def _wait_etcd_ready(port, log_file, timeout=_DEFAULT_ETCD_READY_TIMEOUT):
     """Poll TCP + HTTP /health until etcd is up."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -221,10 +481,36 @@ def _wait_etcd_ready(port, log_file, timeout=15):
     with open(log_file) as f:
         log = f.read()
     raise TimeoutError(
-        f"etcd did not become ready within {timeout}s.\nLog:\n{log}")
+        f"etcd did not become ready within {timeout:g}s "
+        f"(RULES_K8S_ETCD_READY_TIMEOUT).\nLog:\n{log}")
 
 
-def _start_etcd(etcd_bin, test_tmpdir):
+def _etcd_supports_no_fsync(etcd_bin):
+    """True if this etcd has --unsafe-no-fsync (etcd >= 3.5; every envtest
+    release rules_kubernetes downloads has it, a kubernetes.system() etcd
+    may not)."""
+    try:
+        r = subprocess.run([etcd_bin, "--help"], capture_output=True,
+                           text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return "--unsafe-no-fsync" in r.stdout + r.stderr
+
+
+def _etcd_extra_flags(etcd_bin, unsafe_no_fsync):
+    if not unsafe_no_fsync:
+        return []
+    if not _etcd_supports_no_fsync(etcd_bin):
+        _log("etcd has no --unsafe-no-fsync (etcd < 3.5); running with fsync")
+        return []
+    # The data dir lives in $TEST_TMPDIR and is thrown away with the test,
+    # so a crash-consistent disk image buys nothing; fsync stalls on a loaded
+    # host do cause `etcdserver: request timed out` (#5).
+    return ["--unsafe-no-fsync"]
+
+
+def _start_etcd(etcd_bin, test_tmpdir, ready_timeout=_DEFAULT_ETCD_READY_TIMEOUT,
+                extra_flags=(), pass_fds=()):
     """Start etcd; return (proc, client_port). Retries on port conflict."""
     for attempt in range(1, 6):
         client_port = _allocate_port()
@@ -248,15 +534,16 @@ def _start_etcd(etcd_bin, test_tmpdir):
             "--initial-cluster-state",       "new",
             "--initial-cluster-token",       f"test-{token}",
             "--log-level",                   "error",
-        ]
+        ] + list(extra_flags)
         env = os.environ.copy()
         env["HOME"] = test_tmpdir
 
         with open(log_file, "w") as log_f:
-            proc = subprocess.Popen(cmd, stdout=log_f, stderr=log_f, env=env)
+            proc = subprocess.Popen(cmd, stdout=log_f, stderr=log_f, env=env,
+                                    pass_fds=pass_fds)
 
         try:
-            _wait_etcd_ready(client_port, log_file)
+            _wait_etcd_ready(client_port, log_file, ready_timeout)
             return proc, client_port
         except TimeoutError:
             proc.terminate()
@@ -275,7 +562,8 @@ def _start_etcd(etcd_bin, test_tmpdir):
 # kube-apiserver
 # ---------------------------------------------------------------------------
 
-def _wait_apiserver_ready(port, pki_dir, log_file, timeout=45):
+def _wait_apiserver_ready(port, pki_dir, log_file,
+                          timeout=_DEFAULT_APISERVER_READY_TIMEOUT):
     """Poll TCP + HTTPS /readyz until kube-apiserver is up."""
     # Wait for the TCP port to open first (fast, no TLS setup needed).
     deadline = time.monotonic() + timeout
@@ -288,7 +576,8 @@ def _wait_apiserver_ready(port, pki_dir, log_file, timeout=45):
     else:
         with open(log_file) as f:
             raise TimeoutError(
-                f"kube-apiserver TCP port did not open within {timeout}s.\n"
+                f"kube-apiserver TCP port did not open within {timeout:g}s "
+                f"(RULES_K8S_APISERVER_READY_TIMEOUT).\n"
                 f"Log:\n{f.read()}")
 
     ssl_ctx   = _make_ssl_ctx(pki_dir)
@@ -307,11 +596,13 @@ def _wait_apiserver_ready(port, pki_dir, log_file, timeout=45):
     with open(log_file) as f:
         log = f.read()
     raise TimeoutError(
-        f"kube-apiserver /readyz did not return 200 within {timeout}s.\n"
+        f"kube-apiserver /readyz did not return 200 within {timeout:g}s "
+        f"(RULES_K8S_APISERVER_READY_TIMEOUT).\n"
         f"Last error: {last_err}\nLog:\n{log}")
 
 
-def _start_apiserver(apiserver_bin, etcd_client_port, pki_dir, test_tmpdir):
+def _start_apiserver(apiserver_bin, etcd_client_port, pki_dir, test_tmpdir,
+                     ready_timeout=_DEFAULT_APISERVER_READY_TIMEOUT, pass_fds=()):
     """Start kube-apiserver; return (proc, port). Retries on port conflict."""
     for attempt in range(1, 6):
         port     = _allocate_port()
@@ -340,10 +631,11 @@ def _start_apiserver(apiserver_bin, etcd_client_port, pki_dir, test_tmpdir):
         env["HOME"] = test_tmpdir
 
         with open(log_file, "w") as log_f:
-            proc = subprocess.Popen(cmd, stdout=log_f, stderr=log_f, env=env)
+            proc = subprocess.Popen(cmd, stdout=log_f, stderr=log_f, env=env,
+                                    pass_fds=pass_fds)
 
         try:
-            _wait_apiserver_ready(port, pki_dir, log_file)
+            _wait_apiserver_ready(port, pki_dir, log_file, ready_timeout)
             return proc, port
         except TimeoutError:
             proc.terminate()
@@ -383,6 +675,10 @@ def _apply_manifests(kubectl_bin, kubeconfig, manifest_files):
     # unconditionally; rules_kubernetes is the source of truth for
     # the manifests it applies, so taking over fields from a prior
     # client-side apply is the right default.
+    #
+    # Returns the names of the CustomResourceDefinitions applied, from
+    # kubectl's "<kind>.<group>/<name> serverside-applied" lines.
+    crds = []
     for path in manifest_files:
         _log(f"applying (server-side): {os.path.basename(path)}")
         r = _kubectl(kubectl_bin, kubeconfig,
@@ -393,6 +689,48 @@ def _apply_manifests(kubectl_bin, kubeconfig, manifest_files):
                 f"kubectl apply failed for {path}:\n{r.stdout}\n{r.stderr}")
         if r.stdout.strip():
             _log(r.stdout.strip())
+        crds += _applied_crds(r.stdout)
+    return crds
+
+
+_CRD_PREFIX = "customresourcedefinition.apiextensions.k8s.io/"
+
+
+def _applied_crds(apply_stdout):
+    names = []
+    for line in apply_stdout.splitlines():
+        ref = line.split(" ", 1)[0]
+        if ref.startswith(_CRD_PREFIX):
+            names.append(ref[len(_CRD_PREFIX):])
+    return names
+
+
+def _wait_crds_established(kubectl_bin, kubeconfig, crds, timeout):
+    """Wait until every CRD in `crds` has condition Established=True (#5).
+
+    A CRD's custom resources can't be created until it is Established, and
+    `kubectl wait --for=condition=Established` errors out ("<nil> is of the
+    type <nil>") while the CRD has no conditions yet, so consumers each
+    carried a retry loop. Polls `kubectl get` instead."""
+    pending = list(dict.fromkeys(crds))
+    _log(f"waiting for {len(pending)} CRD(s) to be Established…")
+    deadline = time.monotonic() + timeout
+    jsonpath = '{.status.conditions[?(@.type=="Established")].status}'
+    while True:
+        still = []
+        for name in pending:
+            r = _kubectl(kubectl_bin, kubeconfig, "get", "crd", name,
+                         "-o", f"jsonpath={jsonpath}")
+            if r.returncode != 0 or r.stdout.strip() != "True":
+                still.append(name)
+        pending = still
+        if not pending:
+            return
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"CRDs not Established after {timeout:g} s: "
+                f"{', '.join(pending)} (RULES_K8S_CRD_ESTABLISHED_TIMEOUT)")
+        time.sleep(0.2)
 
 
 def _create_namespace(kubectl_bin, kubeconfig, namespace):
@@ -455,7 +793,7 @@ class _K8sState:
     kubectl_bin:   str
 
 
-def _k8s_setup(m, workspace):
+def _k8s_setup(m, workspace, cfg):
     test_tmpdir = os.environ.get("TEST_TMPDIR") or tempfile.mkdtemp()
 
     # Resolve binary paths from the manifest's short_paths.
@@ -470,18 +808,28 @@ def _k8s_setup(m, workspace):
     namespace = "k8s-test-" + uuid.uuid4().hex[:12]
     pki_dir   = os.path.join(test_tmpdir, "pki")
 
+    # Held (not closed) until this process, or the test binary it execs,
+    # and the etcd and kube-apiserver that inherit it have all exited.
+    slot = _acquire_slot(cfg.max_servers,
+                         os.environ.get("TEST_TARGET") or "?")
+    slot_fds = () if slot is None else (slot,)
+    _wait_free_memory(cfg.min_free_mb)
+
     _log("bootstrapping TLS…")
     _bootstrap_tls(pki_dir)
 
     _log("starting etcd…")
-    etcd_proc, etcd_client_port = _start_etcd(etcd_bin, test_tmpdir)
-    atexit.register(etcd_proc.terminate)
+    etcd_proc, etcd_client_port = _start_etcd(
+        etcd_bin, test_tmpdir, cfg.etcd_ready_timeout,
+        _etcd_extra_flags(etcd_bin, cfg.etcd_unsafe_no_fsync), slot_fds)
+    atexit.register(_stop_proc, etcd_proc)
     _log(f"etcd ready on :{etcd_client_port}")
 
     _log("starting kube-apiserver…")
     apiserver_proc, apiserver_port = _start_apiserver(
-        apiserver_bin, etcd_client_port, pki_dir, test_tmpdir)
-    atexit.register(apiserver_proc.terminate)
+        apiserver_bin, etcd_client_port, pki_dir, test_tmpdir,
+        cfg.apiserver_ready_timeout, slot_fds)
+    atexit.register(_stop_proc, apiserver_proc)
     apiserver_url = f"https://{HOST}:{apiserver_port}"
     _log(f"kube-apiserver ready at {apiserver_url}")
 
@@ -492,7 +840,10 @@ def _k8s_setup(m, workspace):
     if manifest_files:
         _log(f"applying {len(manifest_files)} manifest file(s)…")
         resolved = [_find_runfile(p, workspace) for p in manifest_files]
-        _apply_manifests(kubectl_bin, kubeconfig, resolved)
+        crds = _apply_manifests(kubectl_bin, kubeconfig, resolved)
+        if crds:
+            _wait_crds_established(kubectl_bin, kubeconfig, crds,
+                                   cfg.crd_established_timeout)
 
     _log(f"creating namespace {namespace}…")
     _create_namespace(kubectl_bin, kubeconfig, namespace)
@@ -510,8 +861,8 @@ def _k8s_setup(m, workspace):
 # Test mode
 # ---------------------------------------------------------------------------
 
-def main_test(m, workspace):
-    state = _k8s_setup(m, workspace)
+def main_test(m, workspace, cfg):
+    state = _k8s_setup(m, workspace, cfg)
 
     controller_proc = None
     if "controller_binary" in m:
@@ -531,7 +882,7 @@ def main_test(m, workspace):
         _log(f"starting controller: {os.path.basename(controller_bin)}")
         controller_proc = subprocess.Popen(
             [controller_bin], env=controller_env)
-        atexit.register(controller_proc.terminate)
+        atexit.register(_stop_proc, controller_proc)
 
         _log("waiting for controller readiness…")
         _wait_controller_ready(
@@ -563,8 +914,8 @@ def main_test(m, workspace):
 # Server mode
 # ---------------------------------------------------------------------------
 
-def main_server(m, workspace):
-    state = _k8s_setup(m, workspace)
+def main_server(m, workspace, cfg):
+    state = _k8s_setup(m, workspace, cfg)
 
     output_env_file = os.environ.get("RULES_K8S_OUTPUT_ENV_FILE", "")
     if not output_env_file:
@@ -601,6 +952,12 @@ def main_server(m, workspace):
 def main():
     mode = os.environ.get("RULES_K8S_MODE", "test")
 
+    try:
+        cfg = _load_config()
+    except ConfigError as e:
+        print(f"[rules_kubernetes] ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
+
     if mode == "server":
         manifest_path = os.environ.get("RULES_K8S_MANIFEST", "")
         var_name      = "RULES_K8S_MANIFEST"
@@ -620,9 +977,9 @@ def main():
     workspace = m["workspace"]
 
     if mode == "server":
-        main_server(m, workspace)
+        main_server(m, workspace, cfg)
     else:
-        main_test(m, workspace)
+        main_test(m, workspace, cfg)
 
 
 if __name__ == "__main__":
