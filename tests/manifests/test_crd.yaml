@@ -1,0 +1,26 @@
+# A CRD the launcher must wait for (#5): manifest_test creates a Widget as
+# soon as the test starts, which fails unless the CRD is Established.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: widgets.rules-k8s.test
+spec:
+  group: rules-k8s.test
+  scope: Namespaced
+  names:
+    kind: Widget
+    plural: widgets
+    singular: widget
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                size:
+                  type: integer

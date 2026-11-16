@@ -49,6 +49,9 @@ rules_kubernetes/
     ├── kubernetes_health_check_test.sh  # kubernetes_health_check behavior test
     ├── k8s_version_test.sh          # k8s_version: server gitVersion + kubectl minor
     ├── kubectl_run_test.sh          # //:kubectl_<minor>: version, relative paths from BUILD_WORKING_DIRECTORY
+    ├── launcher_unit_test.sh        # No API server: RULES_K8S_* parsing, etcd argv (fake etcd), server slots
+    ├── etcd_flags_test.sh           # Real etcd: --unsafe-no-fsync on (default) / off (RULES_K8S_ETCD_UNSAFE_NO_FSYNC=0)
+    ├── slot_limit_test.sh           # RULES_K8S_MAX_SERVERS=1: two kubernetes_server launchers serialize
     └── controllers/
         └── echo_controller/        # Example controller for smoke tests
 ```
@@ -87,6 +90,34 @@ The launcher (`private/launcher.py`) supports two modes selected by `RULES_K8S_M
 
 Test mode is used by `kubernetes_test`. Server mode is used by `kubernetes_server`
 for `rules_itest` integration.
+
+### Launcher budgets and admission (v0.6, #5)
+
+Read by `_load_config()` before the manifest; an invalid value exits 1 with
+`[rules_kubernetes] ERROR: <VAR>=...` (no traceback, nothing started).
+
+| Variable | Default | Effect |
+|---|---|---|
+| `RULES_K8S_ETCD_READY_TIMEOUT` | `15` | `_wait_etcd_ready` budget (seconds, positive) |
+| `RULES_K8S_APISERVER_READY_TIMEOUT` | `45` | `_wait_apiserver_ready` budget |
+| `RULES_K8S_CRD_ESTABLISHED_TIMEOUT` | `30` | `_wait_crds_established` budget |
+| `RULES_K8S_ETCD_UNSAFE_NO_FSYNC` | `1` | `--unsafe-no-fsync` on etcd if `etcd --help` lists it; `0` = off |
+| `RULES_K8S_MAX_SERVERS` | usable CPUs, min 2 | slots; `0` = no limit |
+| `RULES_K8S_SLOT_DIR` | `/dev/shm/rules_kubernetes-<uid>/slots` | slot files (mode 0666) |
+| `RULES_K8S_MIN_FREE_MB` | unset | wait for `MemAvailable` after taking a slot |
+
+The slot is taken before the TLS bootstrap: a non-blocking `flock` on
+`slot-<i>`, polled every second, holders logged once a minute. The fd is
+inheritable and passed to etcd and kube-apiserver (`pass_fds`), so it survives
+test mode's `execve` and stays held until the test binary, etcd and
+kube-apiserver have all exited. `/dev/shm` because `linux-sandbox` mounts
+`$XDG_RUNTIME_DIR` read-only and gives each test a private `/tmp`. Modeled on
+rules_kind v0.3.0's `RULES_KIND_MAX_CLUSTERS`; see DESIGN.md for where it
+differs.
+
+`kubernetes_test(env = {...})` reaches the launcher via `RunEnvironmentInfo`
+(`_k8s_launcher_test` has an `env` attribute since v0.6.0; before that, `env`
+failed at load time).
 
 ### Port allocation
 
@@ -266,7 +297,7 @@ with `//...` for consumers even though the tests use dev-only `rules_python`.
 ### MODULE.bazel (Bzlmod)
 
 ```python
-bazel_dep(name = "rules_kubernetes", version = "0.5.0")
+bazel_dep(name = "rules_kubernetes", version = "0.6.0")
 
 # Nothing else needed: rules_kubernetes declares kubernetes.version() for
 # every supported version. To use host binaries for a version instead
@@ -294,9 +325,10 @@ bazel test //tests/...
 
 All tests must pass before any commit with code changes.
 
-### Test results (last full run: 2026-11-08)
+### Test results (last full run: 2026-11-16)
 
-All 13 tests pass on Linux x86_64 (hermetic envtest binaries; default 1.35).
+All 17 tests pass on Linux x86_64 (hermetic envtest binaries; default 1.35),
+also with `--test_env=RULES_K8S_MAX_SERVERS=2` (11 tests then wait for a slot).
 
 | Test target                            | What it verifies                                                              | Result |
 |----------------------------------------|-------------------------------------------------------------------------------|--------|
@@ -313,6 +345,10 @@ All 13 tests pass on Linux x86_64 (hermetic envtest binaries; default 1.35).
 | `//tests:k8s_1_36_version_test`        | `k8s_version = "1.36"`: server v1.36.2, kubectl 1.36                          | PASSED |
 | `//tests:k8s_1_37_version_test`        | `k8s_version = "1.37"`: server v1.37.0, kubectl 1.37                          | PASSED |
 | `//tests:kubectl_run_test`             | `//:kubectl_<minor>` and `//:kubectl` run the right kubectl minor; relative paths resolve from `BUILD_WORKING_DIRECTORY` | PASSED |
+| `//tests:launcher_unit_test`           | `RULES_K8S_*` defaults, values, invalid values exit 1 with a message; `--unsafe-no-fsync` on a fake etcd's argv (default, `=0`, etcd without the flag); 1 s etcd budget; `RULES_K8S_MAX_SERVERS=1`: a second process waits and names the holder, across the holder's execve, until SIGKILL; `0`; default dir writable in the sandbox (no API server) | PASSED |
+| `//tests:etcd_no_fsync_test`           | the real etcd runs with `--unsafe-no-fsync` by default                        | PASSED |
+| `//tests:etcd_fsync_test`              | `env = {"RULES_K8S_ETCD_UNSAFE_NO_FSYNC": "0"}`: etcd runs without it (and `env` reaches the launcher) | PASSED |
+| `//tests:slot_limit_test`              | `RULES_K8S_MAX_SERVERS=1`: two `kubernetes_server` launchers serialize; the second waits, names the first, starts after it shuts down; no etcd/apiserver outlives its launcher | PASSED |
 
 ### Launcher script
 
@@ -333,14 +369,18 @@ Both modes share `_k8s_setup`, which:
 4. Allocates three free TCP ports.
 5. Generates UUID namespace name.
 6. Bootstraps TLS credentials (`_bootstrap_tls`).
-7. Starts `etcd`; waits for readiness.
-8. Starts `kube-apiserver`; waits for `/readyz` (max 30 s).
-9. Retries on port conflict only; fails immediately on any other error.
-10. Applies manifest files via `kubectl apply -f` in order.
-11. Creates the UUID namespace via `kubectl create namespace`.
-12. Starts the controller subprocess (if provided).
-13. Waits for controller readiness (leader-election lease poll).
-14. Returns a `_K8sState` dataclass with connection details.
+7. Takes a server slot (`RULES_K8S_MAX_SERVERS`), optionally waits for
+   `RULES_K8S_MIN_FREE_MB`.
+8. Starts `etcd` (`--unsafe-no-fsync` by default); waits for readiness
+   (`RULES_K8S_ETCD_READY_TIMEOUT`, 15 s).
+9. Starts `kube-apiserver`; waits for `/readyz`
+   (`RULES_K8S_APISERVER_READY_TIMEOUT`, 45 s).
+10. Retries on port conflict only; fails immediately on any other error.
+11. Applies manifest files via `kubectl apply -f` in order.
+12. Creates the UUID namespace via `kubectl create namespace`.
+13. Starts the controller subprocess (if provided).
+14. Waits for controller readiness (leader-election lease poll).
+15. Returns a `_K8sState` dataclass with connection details.
 
 After `_k8s_setup`, test mode calls `os.execve` with env vars set;
 server mode writes the env file and blocks.
@@ -376,7 +416,9 @@ All test shell scripts must:
   leader-election lease. Controllers that do not use leader election need a
   custom readiness probe.
 - **`kubernetes_test` adds ~3–6 s overhead per test** for etcd + apiserver
-  startup. For very large test suites, consider a shared-server mode using
+  startup, plus any wait for a server slot.
+- **The server limit is verified on Linux only**; without `/dev/shm` the slot
+  directory falls back to `$XDG_RUNTIME_DIR` or the temp dir. For very large test suites, consider a shared-server mode using
   `kubernetes_server`.
 - **Target name collision.** Two `kubernetes_server` targets with the same local
   name in different packages write to the same `$TEST_TMPDIR/<name>.env`. Use

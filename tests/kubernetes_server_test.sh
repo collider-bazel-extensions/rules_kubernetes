@@ -30,16 +30,17 @@ echo "--- kubernetes_server_test ---"
 "$SERVER_BIN" &
 SERVER_PID=$!
 
-# Wait up to 60 s for the env file to appear.
+# Wait up to 240 s for the env file to appear: startup plus any wait for a
+# server slot (RULES_K8S_MAX_SERVERS).
 # kube-apiserver startup (including TLS bootstrap) takes ~5–10 s.
 echo "Waiting for env file: $ENV_FILE"
-for i in $(seq 1 300); do
+for i in $(seq 1 1200); do
     [[ -f "$ENV_FILE" ]] && break
     sleep 0.2
 done
 
 if [[ ! -f "$ENV_FILE" ]]; then
-    echo "FAIL: env file never appeared after 60 s" >&2
+    echo "FAIL: env file never appeared after 240 s" >&2
     exit 1
 fi
 echo "OK: env file appeared"

@@ -35,7 +35,10 @@ kubernetes_controller(
 
 kubernetes_manifest(
     name = "test_manifests",
-    srcs = ["manifests/test_clusterrole.yaml"],
+    srcs = [
+        "manifests/test_clusterrole.yaml",
+        "manifests/test_crd.yaml",
+    ],
 )
 
 # ---------------------------------------------------------------------------
@@ -183,4 +186,47 @@ sh_test(
         "//:kubectl_1_37",
     ],
     size = "small",
+)
+
+# ---------------------------------------------------------------------------
+# Launcher budgets (#5): readiness timeouts, etcd --unsafe-no-fsync,
+# RULES_K8S_MAX_SERVERS slots
+# ---------------------------------------------------------------------------
+
+# No API server: timeout parsing, invalid settings, the etcd command line
+# (with a fake etcd), slots across processes and across execve.
+sh_test(
+    name = "launcher_unit_test",
+    srcs = ["launcher_unit_test.sh"],
+    data = ["//private:launcher.py"],
+    size = "small",
+)
+
+# --unsafe-no-fsync reaches the real etcd by default, and not when opted out.
+kubernetes_test(
+    name = "etcd_no_fsync_test",
+    srcs = ["etcd_flags_test.sh"],
+    args = ["yes"],
+    size = "medium",
+)
+
+kubernetes_test(
+    name = "etcd_fsync_test",
+    srcs = ["etcd_flags_test.sh"],
+    args = ["no"],
+    env  = {"RULES_K8S_ETCD_UNSAFE_NO_FSYNC": "0"},
+    size = "medium",
+)
+
+# RULES_K8S_MAX_SERVERS=1: a second kubernetes_server launcher waits for the
+# first one's slot.
+sh_test(
+    name = "slot_limit_test",
+    srcs = ["slot_limit_test.sh"],
+    args = [
+        "$(rootpath :k8s_server_test_svc)",
+        "k8s_server_test_svc",
+    ],
+    data = [":k8s_server_test_svc"],
+    size = "medium",
 )

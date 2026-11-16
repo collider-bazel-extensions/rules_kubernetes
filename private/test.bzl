@@ -110,10 +110,15 @@ exec python3 "$RUNFILES_ROOT/{workspace}/{launcher_short}" "$@"
     if manifest_info:
         rf = rf.merge(ctx.runfiles(transitive_files = manifest_info.manifest_files))
 
-    return [DefaultInfo(
-        executable = wrapper,
-        runfiles   = rf,
-    )]
+    return [
+        DefaultInfo(
+            executable = wrapper,
+            runfiles   = rf,
+        ),
+        # `env` (e.g. RULES_K8S_* tuning) reaches the launcher, which passes
+        # its environment on to the test binary.
+        RunEnvironmentInfo(environment = ctx.attr.env),
+    ]
 
 _k8s_launcher_test = rule(
     doc = "Internal rule: wraps a test binary with an ephemeral Kubernetes API server.",
@@ -137,6 +142,9 @@ _k8s_launcher_test = rule(
                        "Set by the kubernetes_test macro from `k8s_version`.",
             mandatory = True,
             providers = [KubernetesBinaryInfo],
+        ),
+        "env": attr.string_dict(
+            doc = "Environment for the launcher and, through it, the test binary.",
         ),
         "_launcher": attr.label(
             doc            = "The launcher.py script.",
