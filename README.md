@@ -585,3 +585,11 @@ service_test(
   then fails to load; query `@rules_kubernetes//:all` instead.
 - **Target name uniqueness** — two `kubernetes_server` targets with the same
   local name in different packages write to the same `$TEST_TMPDIR/<name>.env`.
+
+---
+
+## Requesting a new rules package
+
+Want Bazel rules for another tool or service?
+[Request a rules package](https://github.com/collider-bazel-extensions/.github/issues/new?template=request-a-rules-package.yml).
+The [organization page](https://github.com/collider-bazel-extensions) lists every package.
