@@ -2,8 +2,9 @@
 # etcd_flags_test.sh <yes|no>
 #
 # Runs inside kubernetes_test: finds this test's etcd (its --data-dir is
-# $TEST_TMPDIR/etcd_data) and checks whether --unsafe-no-fsync is on its
-# command line (#5), then writes through the API server.
+# $TEST_TMPDIR/<name>.k8s/etcd_data, next to $TEST_TMPDIR/<name>.kubeconfig)
+# and checks whether --unsafe-no-fsync is on its command line (#5), then
+# writes through the API server.
 
 set -euo pipefail
 
@@ -14,7 +15,7 @@ require_env KUBECTL
 require_env TEST_TMPDIR
 
 want="$1"
-data_dir="$TEST_TMPDIR/etcd_data"
+data_dir="${KUBECONFIG%.kubeconfig}.k8s/etcd_data"
 cmdline=""
 for f in /proc/[0-9]*/cmdline; do
     args="$(tr '\0' '\n' < "$f" 2>/dev/null)" || continue

@@ -10,6 +10,9 @@ set -euo pipefail
 #   - RULES_K8S_MAX_SERVERS slots: a second launcher process waits, names the
 #     holder, and gets the slot once the holder (and everything that
 #     inherited the slot, across execve) is gone; 0 = no limit.
+#   - Name claims (rules_kind#25): a second launcher for the same target name
+#     in one test fails at once, naming both labels, before it writes
+#     anything; a claim whose launcher has exited is taken over.
 
 [[ -n "${TEST_TMPDIR:-}" ]] || { echo "ERROR: \$TEST_TMPDIR not set" >&2; exit 1; }
 RUNFILES="${TEST_SRCDIR:-${RUNFILES_DIR:-${BASH_SOURCE[0]}.runfiles}}"
@@ -208,5 +211,55 @@ os.unlink(probe)
 ' || fail "default slot directory not usable"
     echo "PASS: default slot directory /dev/shm/rules_kubernetes-$(id -u)/slots is usable"
 fi
+
+# --- 4. Name claims ----------------------------------------------------------
+echo "=== name claims"
+claims="$TEST_TMPDIR/claims"
+mkdir -p "$claims"
+python3 -c '
+import launcher, sys, time
+launcher._claim_name(sys.argv[1], "c", "//b:c", "kubernetes_server")
+print("holding", flush=True)
+time.sleep(600)
+' "$claims" > "$TEST_TMPDIR/claim_holder.log" 2>&1 &
+holder=$!
+for _ in $(seq 50); do grep -q holding "$TEST_TMPDIR/claim_holder.log" && break; sleep 0.1; done
+grep -q holding "$TEST_TMPDIR/claim_holder.log" || { cat "$TEST_TMPDIR/claim_holder.log" >&2; fail "holder did not claim c"; }
+
+# A real launcher (server mode) with the same name: exits 1 naming both
+# targets, before it resolves a binary or writes a file.
+echo '{"workspace": "_main", "kube_apiserver_bin": "x", "etcd_bin": "x", "kubectl_bin": "x"}' > "$claims/manifest.json"
+set +e
+out="$(TEST_TMPDIR="$claims" RULES_K8S_MODE=server RULES_K8S_MANIFEST="$claims/manifest.json" \
+       RULES_K8S_OUTPUT_ENV_FILE="$claims/c.env" RULES_K8S_TARGET_NAME=c RULES_K8S_TARGET_LABEL=//a:c \
+       python3 "$launcher_dir/launcher.py" 2>&1)"
+rc=$?
+set -e
+[[ $rc == 1 ]] || fail "second claimant: exit $rc, want 1: $out"
+grep -qF "ERROR: kubernetes_server //a:c: \$TEST_TMPDIR/c.env and c.kubeconfig are already used by //b:c (pid $holder) in this test; give the targets different names" <<<"$out" \
+    || fail "second claimant: message does not name both targets: $out"
+grep -q Traceback <<<"$out" && fail "second claimant: traceback: $out"
+leftover="$(cd "$claims" && ls -A | grep -v -x -e c.claim -e manifest.json || true)"
+[[ -z "$leftover" ]] || fail "second claimant wrote files: $leftover"
+grep -q "\"pid\": $holder" "$claims/c.claim" || fail "holder's claim was replaced: $(cat "$claims/c.claim")"
+echo "PASS: a second launcher for the same name fails, naming both targets"
+
+# Different names don't conflict.
+python3 -c '
+import launcher, sys
+launcher._claim_name(sys.argv[1], "d", "//a:d", "kubernetes_server")
+' "$claims" || fail "a different name was refused"
+echo "PASS: different names coexist"
+
+# The holder exits: its claim is taken over.
+kill -KILL "$holder"; wait "$holder" 2>/dev/null || true
+python3 -c '
+import json, launcher, os, sys
+launcher._claim_name(sys.argv[1], "c", "//a:c", "kubernetes_test")
+held = json.load(open(os.path.join(sys.argv[1], "c.claim")))
+assert held == {"label": "//a:c", "pid": os.getpid(), "rule": "kubernetes_test"}, held
+' "$claims" || fail "stale claim not taken over"
+ls "$claims" | grep -q '\.tmp$' && fail "temporary claim files left: $(ls "$claims")"
+echo "PASS: an exited launcher's claim is taken over"
 
 echo "PASS"

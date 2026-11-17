@@ -6,6 +6,12 @@ load(":manifest.bzl", "KubernetesManifestInfo")
 load(":controller.bzl", "KubernetesControllerInfo")
 load(":versions.bzl", "binary_label")
 
+def _label_str(label):
+    # "//pkg:name" for the main repo, "@repo//pkg:name" otherwise: what the
+    # launcher prints when two targets claim the same name in one test.
+    s = str(label)
+    return s[2:] if s.startswith("@@//") else s
+
 # ---------------------------------------------------------------------------
 # JSON serialisation helpers (Bazel 6 has no json.encode)
 # ---------------------------------------------------------------------------
@@ -79,12 +85,16 @@ if [[ -z "$RUNFILES_ROOT" ]]; then
 fi
 export K8S_MANIFEST="$RUNFILES_ROOT/{workspace}/{manifest_short}"
 export K8S_TEST_BINARY="$RUNFILES_ROOT/{workspace}/{inner_short}"
+export RULES_K8S_TARGET_NAME="{name}"
+export RULES_K8S_TARGET_LABEL="{label}"
 exec python3 "$RUNFILES_ROOT/{workspace}/{launcher_short}" "$@"
 """.format(
         workspace      = workspace,
         manifest_short = manifest_short,
         inner_short    = inner_short,
         launcher_short = launcher_short,
+        name           = ctx.label.name,
+        label          = _label_str(ctx.label),
     )
 
     wrapper = ctx.actions.declare_file(ctx.label.name + "_k8s_launcher.sh")

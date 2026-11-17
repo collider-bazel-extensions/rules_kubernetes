@@ -209,7 +209,7 @@ main repository too, which would hide `//tests/...` from its own CI.
 test runtime — no pre-baked certs in the repository:
 
 ```
-_bootstrap_tls(test_tmpdir)
+_bootstrap_tls(pki_dir)
   ├── generate CA key + self-signed cert           (ca.key, ca.crt)
   ├── generate server key + CSR                    (server.key, server.csr)
   ├── sign server cert with CA                     (server.crt)
@@ -217,16 +217,16 @@ _bootstrap_tls(test_tmpdir)
   └── sign client cert with CA                     (client.crt)
 ```
 
-All files written to `$TEST_TMPDIR/pki/`. The launcher uses `openssl`
+All files written to `$TEST_TMPDIR/<name>.k8s/pki/`. The launcher uses `openssl`
 subprocess calls. The generated kubeconfig references these paths and is
-written to `$TEST_TMPDIR/kubeconfig`.
+written to `$TEST_TMPDIR/<name>.kubeconfig` (see Per-cluster paths).
 
 `kube-apiserver` is started with:
 
 ```
---tls-cert-file     $TEST_TMPDIR/pki/server.crt
---tls-private-key-file $TEST_TMPDIR/pki/server.key
---client-ca-file    $TEST_TMPDIR/pki/ca.crt
+--tls-cert-file     $TEST_TMPDIR/<name>.k8s/pki/server.crt
+--tls-private-key-file $TEST_TMPDIR/<name>.k8s/pki/server.key
+--client-ca-file    $TEST_TMPDIR/<name>.k8s/pki/ca.crt
 ```
 
 The client cert is written into the kubeconfig as `client-certificate` /
@@ -297,6 +297,8 @@ Expands into two targets, identical in structure to `temporal_test`:
 ```
 read K8S_MANIFEST (JSON)
   ↓
+claim $TEST_TMPDIR/<name>.claim  [exit 1, naming both labels, if a live launcher holds it]
+  ↓
 resolve runfile paths
   ↓
 ensure execute bits on kube-apiserver, etcd, kubectl, controller binary
@@ -307,7 +309,7 @@ generate UUID namespace  (k8s-test-<12-hex>)
   ↓
 take a server slot (RULES_K8S_MAX_SERVERS; see Launcher budgets and admission)
   ↓
-_bootstrap_tls()  → $TEST_TMPDIR/pki/ + $TEST_TMPDIR/kubeconfig
+_bootstrap_tls()  → $TEST_TMPDIR/<name>.k8s/pki/ + $TEST_TMPDIR/<name>.kubeconfig
   ↓
 start etcd  [--unsafe-no-fsync by default; retry on port conflict, up to 5 attempts]
   ↓
@@ -338,7 +340,7 @@ kube-apiserver hold the slot until they have all exited.
 
 | Variable           | Example value                    | Description                        |
 |--------------------|----------------------------------|------------------------------------|
-| `KUBECONFIG`       | `$TEST_TMPDIR/kubeconfig`        | Path to per-test kubeconfig        |
+| `KUBECONFIG`       | `$TEST_TMPDIR/<name>.kubeconfig` | Path to per-test kubeconfig        |
 | `KUBE_NAMESPACE`   | `k8s-test-abc123def456`          | Isolated per-test namespace        |
 | `KUBE_API_SERVER`  | `https://127.0.0.1:54321`        | API server address                 |
 | `KUBECTL`          | `/path/to/kubectl`               | Absolute path to kubectl binary    |
@@ -508,7 +510,7 @@ comes before these clocks start, so it never counts against them.
 `RULES_K8S_ETCD_UNSAFE_NO_FSYNC` defaults to `1`; `0` opts out.
 
 - **Why it is safe.** fsync only matters when a crash must leave the data
-  dir recoverable. The data dir is `$TEST_TMPDIR/etcd_data`. It belongs to
+  dir recoverable. The data dir is `$TEST_TMPDIR/<name>.k8s/etcd_data`. It belongs to
   one test, is never reopened, and Bazel deletes it. If etcd or the host
   crashes, the test fails either way.
 - **Why the default.** The failure it fixes, `etcdserver: request timed out`
@@ -587,6 +589,40 @@ consumers carried their own retry loops. Budget
 wait.
 
 ---
+
+
+## Per-cluster paths (v0.7.0, rules_kind#25)
+
+Up to v0.6.1 every launcher wrote `$TEST_TMPDIR/kubeconfig`,
+`$TEST_TMPDIR/pki/`, `$TEST_TMPDIR/etcd_data`, `etcd.log` and
+`apiserver.log`. Two `kubernetes_server` targets in one test therefore shared
+them: the second launcher deleted the first's etcd data dir (etcd panicked,
+"failed to create WAL"), re-bootstrapped the TLS files under a running
+API server, and the last kubeconfig written won. A rules_kind `kind_cluster`
+in the same test overwrote the same kubeconfig.
+
+- **Paths.** Everything is named after the target: `<name>.kubeconfig`, and
+  `<name>.k8s/` holding `pki/`, `etcd_data/`, `etcd.log`, `apiserver.log` and
+  the controller's ready file. `<name>.env` already was. The env file's (or
+  the test's) `KUBECONFIG` names the kubeconfig; consumers should read it
+  rather than build the path. This changes a documented path, hence a minor
+  version.
+- **Claim.** Two targets with the same name (`//a:c`, `//b:c`) in one test
+  would still collide, so the launcher first claims `$TEST_TMPDIR/<name>.claim`:
+  a complete JSON file (`label`, `pid`, `rule`) linked into place, which
+  fails if the file exists. If the holder's pid is alive, the launcher exits 1
+  before resolving a binary or writing anything, naming both labels. A claim
+  whose pid is gone (a launcher restarted within the test) is taken over. The
+  label reaches the launcher as `RULES_K8S_TARGET_LABEL` from the rule's
+  wrapper, the name as `RULES_K8S_TARGET_NAME`. A `kubernetes_test` keeps its
+  claim through the `execve` (same pid).
+- **Tests.** `launcher_unit_test` covers the claim (a live holder refuses a
+  second claimant through the real entry point, with no files written;
+  different names coexist; a dead holder's claim is taken over).
+  `two_clusters_test` runs two servers in one test and checks that each
+  kubeconfig points at its own API server and a namespace created through one
+  is invisible through the other, then starts `//tests/samename:two_a_svc`
+  and checks that it is refused.
 
 ## Known limitations and non-goals
 

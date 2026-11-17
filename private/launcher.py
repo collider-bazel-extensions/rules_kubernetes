@@ -227,6 +227,70 @@ def _load_config():
 
 
 # ---------------------------------------------------------------------------
+# Per-cluster paths: one name, one set of files in $TEST_TMPDIR
+# ---------------------------------------------------------------------------
+
+class ClaimError(RuntimeError):
+    pass
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _claim_name(test_tmpdir, name, label, rule):
+    """Claim $TEST_TMPDIR/<name>.* for this launcher, before anything starts.
+
+    Two targets with the same name in one test (e.g. //a:c and //b:c as
+    services of one test) would otherwise share <name>.env, <name>.kubeconfig
+    and the state dir, and the last writer would silently win. The claim is
+    $TEST_TMPDIR/<name>.claim, created atomically (link of a complete file),
+    holding {"label", "pid", "rule"}. A claim whose pid is gone (a launcher
+    that was restarted in the same test) is taken over."""
+    path = os.path.join(test_tmpdir, f"{name}.claim")
+    me = {"label": label, "pid": os.getpid(), "rule": rule}
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(me, f)
+    try:
+        for _ in range(5):
+            try:
+                os.link(tmp, path)
+                return path
+            except FileExistsError:
+                pass
+            try:
+                with open(path) as f:
+                    holder = json.load(f)
+                pid = int(holder["pid"])
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError, KeyError, TypeError):
+                holder, pid = {}, None
+            if pid is None or _pid_alive(pid):
+                other = holder.get("label") or "another launcher"
+                who = f"{other} (pid {pid})" if pid else f"{other} ({path} is unreadable)"
+                raise ClaimError(
+                    f"{rule} {label}: $TEST_TMPDIR/{name}.env and "
+                    f"{name}.kubeconfig are already used by {who} in this "
+                    "test; give the targets different names")
+            _log(f"taking over the claim on {name} from exited pid {pid}")
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+        raise ClaimError(f"{rule} {label}: could not claim {path}")
+    finally:
+        os.remove(tmp)
+
+
+# ---------------------------------------------------------------------------
 # Admission: a per-user limit on concurrent API servers
 # ---------------------------------------------------------------------------
 
@@ -509,14 +573,14 @@ def _etcd_extra_flags(etcd_bin, unsafe_no_fsync):
     return ["--unsafe-no-fsync"]
 
 
-def _start_etcd(etcd_bin, test_tmpdir, ready_timeout=_DEFAULT_ETCD_READY_TIMEOUT,
+def _start_etcd(etcd_bin, work_dir, ready_timeout=_DEFAULT_ETCD_READY_TIMEOUT,
                 extra_flags=(), pass_fds=()):
     """Start etcd; return (proc, client_port). Retries on port conflict."""
     for attempt in range(1, 6):
         client_port = _allocate_port()
         peer_port   = _allocate_port()
-        data_dir    = os.path.join(test_tmpdir, "etcd_data")
-        log_file    = os.path.join(test_tmpdir, "etcd.log")
+        data_dir    = os.path.join(work_dir, "etcd_data")
+        log_file    = os.path.join(work_dir, "etcd.log")
 
         if os.path.exists(data_dir):
             import shutil
@@ -536,7 +600,7 @@ def _start_etcd(etcd_bin, test_tmpdir, ready_timeout=_DEFAULT_ETCD_READY_TIMEOUT
             "--log-level",                   "error",
         ] + list(extra_flags)
         env = os.environ.copy()
-        env["HOME"] = test_tmpdir
+        env["HOME"] = work_dir
 
         with open(log_file, "w") as log_f:
             proc = subprocess.Popen(cmd, stdout=log_f, stderr=log_f, env=env,
@@ -601,12 +665,12 @@ def _wait_apiserver_ready(port, pki_dir, log_file,
         f"Last error: {last_err}\nLog:\n{log}")
 
 
-def _start_apiserver(apiserver_bin, etcd_client_port, pki_dir, test_tmpdir,
+def _start_apiserver(apiserver_bin, etcd_client_port, pki_dir, work_dir,
                      ready_timeout=_DEFAULT_APISERVER_READY_TIMEOUT, pass_fds=()):
     """Start kube-apiserver; return (proc, port). Retries on port conflict."""
     for attempt in range(1, 6):
         port     = _allocate_port()
-        log_file = os.path.join(test_tmpdir, "apiserver.log")
+        log_file = os.path.join(work_dir, "apiserver.log")
 
         cmd = [
             apiserver_bin,
@@ -628,7 +692,7 @@ def _start_apiserver(apiserver_bin, etcd_client_port, pki_dir, test_tmpdir,
             "--v",                             "2",
         ]
         env = os.environ.copy()
-        env["HOME"] = test_tmpdir
+        env["HOME"] = work_dir
 
         with open(log_file, "w") as log_f:
             proc = subprocess.Popen(cmd, stdout=log_f, stderr=log_f, env=env,
@@ -791,10 +855,17 @@ class _K8sState:
     apiserver_url: str
     pki_dir:       str
     kubectl_bin:   str
+    state_dir:     str
 
 
-def _k8s_setup(m, workspace, cfg):
+def _k8s_setup(m, workspace, cfg, rule):
     test_tmpdir = os.environ.get("TEST_TMPDIR") or tempfile.mkdtemp()
+
+    # Everything this cluster writes is named after its target, so two
+    # clusters (or a kind_cluster) in one test don't overwrite each other.
+    name  = os.environ.get("RULES_K8S_TARGET_NAME") or "kubernetes"
+    label = os.environ.get("RULES_K8S_TARGET_LABEL") or name
+    _claim_name(test_tmpdir, name, label, rule)
 
     # Resolve binary paths from the manifest's short_paths.
     apiserver_bin = _find_runfile(m["kube_apiserver_bin"], workspace)
@@ -806,7 +877,9 @@ def _k8s_setup(m, workspace, cfg):
     _ensure_executable(kubectl_bin)
 
     namespace = "k8s-test-" + uuid.uuid4().hex[:12]
-    pki_dir   = os.path.join(test_tmpdir, "pki")
+    state_dir = os.path.join(test_tmpdir, f"{name}.k8s")
+    os.makedirs(state_dir, exist_ok=True)
+    pki_dir   = os.path.join(state_dir, "pki")
 
     # Held (not closed) until this process, or the test binary it execs,
     # and the etcd and kube-apiserver that inherit it have all exited.
@@ -820,20 +893,20 @@ def _k8s_setup(m, workspace, cfg):
 
     _log("starting etcd…")
     etcd_proc, etcd_client_port = _start_etcd(
-        etcd_bin, test_tmpdir, cfg.etcd_ready_timeout,
+        etcd_bin, state_dir, cfg.etcd_ready_timeout,
         _etcd_extra_flags(etcd_bin, cfg.etcd_unsafe_no_fsync), slot_fds)
     atexit.register(_stop_proc, etcd_proc)
     _log(f"etcd ready on :{etcd_client_port}")
 
     _log("starting kube-apiserver…")
     apiserver_proc, apiserver_port = _start_apiserver(
-        apiserver_bin, etcd_client_port, pki_dir, test_tmpdir,
+        apiserver_bin, etcd_client_port, pki_dir, state_dir,
         cfg.apiserver_ready_timeout, slot_fds)
     atexit.register(_stop_proc, apiserver_proc)
     apiserver_url = f"https://{HOST}:{apiserver_port}"
     _log(f"kube-apiserver ready at {apiserver_url}")
 
-    kubeconfig = os.path.join(test_tmpdir, "kubeconfig")
+    kubeconfig = os.path.join(test_tmpdir, f"{name}.kubeconfig")
     _write_kubeconfig(kubeconfig, pki_dir, apiserver_url, namespace)
 
     manifest_files = m.get("manifest_files", [])
@@ -854,6 +927,7 @@ def _k8s_setup(m, workspace, cfg):
         apiserver_url = apiserver_url,
         pki_dir       = pki_dir,
         kubectl_bin   = kubectl_bin,
+        state_dir     = state_dir,
     )
 
 
@@ -862,7 +936,7 @@ def _k8s_setup(m, workspace, cfg):
 # ---------------------------------------------------------------------------
 
 def main_test(m, workspace, cfg):
-    state = _k8s_setup(m, workspace, cfg)
+    state = _k8s_setup(m, workspace, cfg, "kubernetes_test")
 
     controller_proc = None
     if "controller_binary" in m:
@@ -870,8 +944,7 @@ def main_test(m, workspace, cfg):
         _ensure_executable(controller_bin)
 
         ready_probe = m.get("ready_probe", "lease")
-        ready_file  = os.path.join(
-            os.environ.get("TEST_TMPDIR", ""), "controller_ready")
+        ready_file  = os.path.join(state.state_dir, "controller_ready")
 
         controller_env = os.environ.copy()
         controller_env["KUBECONFIG"]            = state.kubeconfig
@@ -915,7 +988,7 @@ def main_test(m, workspace, cfg):
 # ---------------------------------------------------------------------------
 
 def main_server(m, workspace, cfg):
-    state = _k8s_setup(m, workspace, cfg)
+    state = _k8s_setup(m, workspace, cfg, "kubernetes_server")
 
     output_env_file = os.environ.get("RULES_K8S_OUTPUT_ENV_FILE", "")
     if not output_env_file:
@@ -976,10 +1049,14 @@ def main():
 
     workspace = m["workspace"]
 
-    if mode == "server":
-        main_server(m, workspace, cfg)
-    else:
-        main_test(m, workspace, cfg)
+    try:
+        if mode == "server":
+            main_server(m, workspace, cfg)
+        else:
+            main_test(m, workspace, cfg)
+    except ClaimError as e:
+        print(f"[rules_kubernetes] ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

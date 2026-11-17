@@ -72,8 +72,10 @@ KubernetesBinaryInfo
 Every `kubernetes_test` target gets:
 - Its own `etcd` process on a dynamically allocated free port
 - Its own `kube-apiserver` process on a dynamically allocated free port
-- Ephemeral TLS credentials generated at runtime in `$TEST_TMPDIR/pki/`
-- A per-test kubeconfig written to `$TEST_TMPDIR/kubeconfig`
+- Ephemeral TLS credentials generated at runtime in `$TEST_TMPDIR/<name>.k8s/pki/`
+- A per-test kubeconfig written to `$TEST_TMPDIR/<name>.kubeconfig`
+- Every path named after the target (`<name>`), claimed first via `$TEST_TMPDIR/<name>.claim`:
+  a second launcher with the same name in one test fails, naming both labels (rules_kind#25)
 - A UUID-based namespace (`k8s-test-<12-hex-chars>`) created at runtime
 - Env vars injected: `KUBECONFIG`, `KUBE_NAMESPACE`, `KUBE_API_SERVER`
 
@@ -130,8 +132,8 @@ Three ports are allocated per test: one for `kube-apiserver`, two for `etcd`
 
 `kube-apiserver` requires TLS. The launcher generates ephemeral credentials at
 runtime via `openssl` subprocess calls (or the `cryptography` Python package if
-available). All cert/key files are written to `$TEST_TMPDIR/pki/` and
-referenced in `$TEST_TMPDIR/kubeconfig`. Nothing is pre-baked into the repo.
+available). All cert/key files are written to `$TEST_TMPDIR/<name>.k8s/pki/` and
+referenced in `$TEST_TMPDIR/<name>.kubeconfig`. Nothing is pre-baked into the repo.
 
 ### Manifest application
 
@@ -289,7 +291,7 @@ with `//...` for consumers even though the tests use dev-only `rules_python`.
 
 | Variable          | Example value             | Description                        |
 |-------------------|---------------------------|------------------------------------|
-| `KUBECONFIG`      | `$TEST_TMPDIR/kubeconfig` | Path to per-test kubeconfig file   |
+| `KUBECONFIG`      | `$TEST_TMPDIR/<name>.kubeconfig` | Path to per-test kubeconfig file   |
 | `KUBE_NAMESPACE`  | `k8s-test-abc123def456`   | Isolated per-test namespace        |
 | `KUBE_API_SERVER` | `https://127.0.0.1:54321` | API server address                 |
 | `KUBECTL`         | `/path/to/kubectl`        | Absolute path to the kubectl binary |
@@ -297,7 +299,7 @@ with `//...` for consumers even though the tests use dev-only `rules_python`.
 ### MODULE.bazel (Bzlmod)
 
 ```python
-bazel_dep(name = "rules_kubernetes", version = "0.6.1")
+bazel_dep(name = "rules_kubernetes", version = "0.7.0")
 
 # Nothing else needed: rules_kubernetes declares kubernetes.version() for
 # every supported version. To use host binaries for a version instead
