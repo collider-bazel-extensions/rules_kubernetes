@@ -297,7 +297,7 @@ with `//...` for consumers even though the tests use dev-only `rules_python`.
 ### MODULE.bazel (Bzlmod)
 
 ```python
-bazel_dep(name = "rules_kubernetes", version = "0.6.0")
+bazel_dep(name = "rules_kubernetes", version = "0.6.1")
 
 # Nothing else needed: rules_kubernetes declares kubernetes.version() for
 # every supported version. To use host binaries for a version instead
