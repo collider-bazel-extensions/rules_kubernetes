@@ -1,0 +1,8 @@
+load("//:defs.bzl", "kubernetes_server")
+
+# The same target name as //tests:two_a_svc, for two_clusters_test: two
+# targets with one name can't share $TEST_TMPDIR/<name>.* in one test.
+kubernetes_server(
+    name = "two_a_svc",
+    visibility = ["//tests:__pkg__"],
+)

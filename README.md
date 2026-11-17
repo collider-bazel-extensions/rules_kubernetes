@@ -42,7 +42,7 @@ bazel test //my/controller/...   # all tests run in parallel, fully isolated
 ### Bzlmod (`MODULE.bazel`)
 
 ```python
-bazel_dep(name = "rules_kubernetes", version = "0.6.1")
+bazel_dep(name = "rules_kubernetes", version = "0.7.0")
 ```
 
 That's all: kube-apiserver, etcd and kubectl are fetched hermetically from
@@ -513,12 +513,21 @@ These are set for every `kubernetes_test` invocation and written to the
 
 | Variable          | Example                   | Description                         |
 |-------------------|---------------------------|-------------------------------------|
-| `KUBECONFIG`      | `$TEST_TMPDIR/kubeconfig` | Per-test kubeconfig (ephemeral TLS) |
+| `KUBECONFIG`      | `$TEST_TMPDIR/<name>.kubeconfig` | Per-test kubeconfig (ephemeral TLS) |
 | `KUBE_NAMESPACE`  | `k8s-test-abc123def456`   | Isolated test namespace             |
 | `KUBE_API_SERVER` | `https://127.0.0.1:54321` | API server address                  |
 | `KUBECTL`         | `/path/to/kubectl`        | Absolute path to kubectl            |
 
 > `kubectl` is **not** on `$PATH` in the Bazel sandbox. Always use `"$KUBECTL"`.
+
+`<name>` is the `kubernetes_test` or `kubernetes_server` target's name. Each
+cluster's files are named after it (`<name>.kubeconfig`, and etcd's data, the
+TLS files and logs under `<name>.k8s/`), so several servers in one test (or a
+rules_kind `kind_cluster` next to one) don't overwrite each other. Read
+`KUBECONFIG` from the env file rather than building the path. Two targets with
+the **same name** in one test would share these paths: the second launcher
+fails at once, naming both labels. Before v0.7.0 every cluster used
+`$TEST_TMPDIR/kubeconfig`.
 
 ---
 

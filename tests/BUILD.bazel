@@ -148,6 +148,28 @@ sh_test(
     size = "medium",
 )
 
+# Two clusters in one test (rules_kind#25): separate kubeconfigs and state,
+# and a third target with A's name is refused.
+kubernetes_server(name = "two_a_svc")
+
+kubernetes_server(name = "two_b_svc")
+
+sh_test(
+    name = "two_clusters_test",
+    srcs = ["two_clusters_test.sh"],
+    args = [
+        "$(rootpath :two_a_svc)",
+        "$(rootpath :two_b_svc)",
+        "$(rootpath //tests/samename:two_a_svc)",
+    ],
+    data = [
+        ":two_a_svc",
+        ":two_b_svc",
+        "//tests/samename:two_a_svc",
+    ],
+    size = "medium",
+)
+
 sh_test(
     name = "kubernetes_health_check_test",
     srcs = ["kubernetes_health_check_test.sh"],
